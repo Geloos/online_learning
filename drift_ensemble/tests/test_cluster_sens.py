@@ -10,7 +10,7 @@ import pytest
 from drift_ensemble import config
 from drift_ensemble.detectors import threshold_for_level
 from drift_ensemble.ensemble import ClusterSensitivityEnsemble
-from tests.fakes import StubDetector
+from drift_ensemble.tests.fakes import StubDetector
 
 ORDER = ["STEPD", "SEED", "HDDMWeighted", "RDDM"]
 CLUSTERS = {"SEED": "ABRUPT", "RDDM": "ABRUPT",

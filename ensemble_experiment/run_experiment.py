@@ -16,10 +16,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts._common import default_workers, fmt_duration, gate  # noqa: E402
+from drift_ensemble.cli import default_workers, fmt_duration, gate  # noqa: E402
 from ensemble_experiment import config  # noqa: E402
-from ensemble_experiment.runner import is_done, run_name, run_spec  # noqa: E402
-from ensemble_experiment.streams import run_specs  # noqa: E402
+from ensemble_experiment.runner import (  # noqa: E402
+    is_done,
+    run_name,
+    run_spec,
+    run_specs,
+)
 
 
 def main() -> None:

@@ -1,10 +1,10 @@
-"""Analysis of finished test runs (PHASE 9, scripts/05).
+"""Analysis of finished test runs (drift_ensemble/scripts/05_analyze.py).
 
 Reads ONLY result folders (never reruns experiments) and writes the tables
-and plots under results/analysis/. Scoring parameters (max delay, delay grid,
-duplicates-as-FP) are analysis-time choices taken from the current config —
-alarms do not depend on them; only warm-up comes from each run's snapshot, so
-shrunken smoke runs analyze correctly too.
+and plots under results/results_drift_ensemble/analysis/. Scoring parameters
+(max delay, delay grid, duplicates-as-FP) are analysis-time choices taken
+from the current config — alarms do not depend on them; only warm-up comes
+from each run's snapshot, so shrunken smoke runs analyze correctly too.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ from drift_ensemble.evaluation import (
 
 SINGLE_METHODS = [m for m in config.METHODS if m.startswith("single_")]
 ENSEMBLE_METHODS = [m for m in config.METHODS if m.startswith("ens_")]
-VERIFIED_METHODS: list[str] = []  # no verified method in the current roster
 # Methods that log detector weights, with their starting weight.
 WEIGHTED_METHODS = {
     "ens_cluster_vote": lambda cfg: cfg["VOTE"]["W_INIT"],
@@ -273,120 +272,6 @@ def first_to_fire(runs) -> pd.DataFrame:
     totals = df.groupby(["mode", "drift_type"])["n_first"].transform("sum")
     df["share"] = df["n_first"] / totals
     return df
-
-
-def _verifications_frame(runs) -> pd.DataFrame:
-    """All verification records of the verified methods, annotated with
-    REAL (t_alarm inside a drift window) and that drift's type."""
-    frames = []
-    for r in runs:
-        if r["meta"]["method"] not in VERIFIED_METHODS:
-            continue
-        df = _csv(r, "verifications.csv")
-        if df.empty:
-            continue
-        meta = r["meta"]
-        gt = sorted(meta["ground_truth"], key=lambda d: d["start"])
-        max_delay = config.MAX_DELAY
-        starts = [d["start"] for d in gt]
-        ends = [d["end"] + max_delay for d in gt]
-
-        def classify(t):
-            from bisect import bisect_right
-            k = bisect_right(starts, t) - 1
-            if k >= 0 and t <= ends[k]:
-                return True, gt[k]["type"]
-            return False, "NONE"
-
-        reals, dtypes = zip(*[classify(t) for t in df["t_alarm"]])
-        df = df.assign(
-            real=list(reals), drift_type=list(dtypes),
-            method=meta["method"], generator=meta["generator"],
-            mode=meta["mode"], seed=meta["seed"],
-        )
-        frames.append(df)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
-def verification_confusion(runs) -> pd.DataFrame:
-    df = _verifications_frame(runs)
-    if df.empty:
-        return df
-    df["reality"] = np.where(df["real"], "REAL", "NOT_REAL")
-    out = (df.groupby(["method", "verdict", "reality"], observed=True)
-           .size().rename("n").reset_index())
-    return out.pivot_table(index=["method", "verdict"], columns="reality",
-                           values="n", fill_value=0).reset_index()
-
-
-def _mute_unmute_counts(runs) -> pd.DataFrame:
-    rows = []
-    for r in runs:
-        if r["meta"]["method"] not in VERIFIED_METHODS:
-            continue
-        w = _csv(r, "weights.csv")
-        mutes = unmutes = 0
-        if not w.empty:
-            for _, grp in w.groupby("detector"):
-                prev = False
-                for muted in grp.sort_values("t")["muted"]:
-                    muted = bool(muted)
-                    if muted and not prev:
-                        mutes += 1
-                    elif prev and not muted:
-                        unmutes += 1
-                    prev = muted
-        rows.append({"method": r["meta"]["method"],
-                     "mode": r["meta"]["mode"],
-                     "generator": r["meta"]["generator"],
-                     "mutes": mutes, "unmutes": unmutes})
-    if not rows:
-        return pd.DataFrame()
-    return (pd.DataFrame(rows)
-            .groupby(["method", "mode", "generator"], observed=True)
-            [["mutes", "unmutes"]].sum().reset_index())
-
-
-def verification_summary(runs) -> pd.DataFrame:
-    """Verification precision (REAL among CONFIRMED) and unfair rejection
-    rate (FALSE_ALARM verdicts among verifications at REAL alarms), split by
-    drift type AND generator; plus mute/unmute/shadow counts on ALL rows."""
-    df = _verifications_frame(runs)
-    if df.empty:
-        return df
-    mu = _mute_unmute_counts(runs)
-    rows = []
-    group_cols = ["method", "mode", "generator"]
-    for keys, sub in df.groupby(group_cols, observed=True):
-        for dtype in ["ALL", "ABRUPT", "GRADUAL"]:
-            s = sub if dtype == "ALL" else sub[sub["drift_type"] == dtype]
-            if s.empty:
-                continue
-            confirmed = s[s["verdict"] == "CONFIRMED"]
-            real = s[s["real"]]
-            row = dict(zip(group_cols, keys))
-            row.update({
-                "drift_type": dtype,
-                "n_verifications": len(s),
-                "n_shadow": int(s["shadow"].sum()),
-                "n_confirmed": len(confirmed),
-                "verification_precision": (
-                    float(confirmed["real"].mean()) if len(confirmed)
-                    else math.nan),
-                "n_real": len(real),
-                "unfair_rejection_rate": (
-                    float((real["verdict"] == "FALSE_ALARM").mean())
-                    if len(real) else math.nan),
-            })
-            if dtype == "ALL" and not mu.empty:
-                hit = mu[(mu["method"] == keys[0]) & (mu["mode"] == keys[1])
-                         & (mu["generator"] == keys[2])]
-                row["mutes"] = int(hit["mutes"].sum())
-                row["unmutes"] = int(hit["unmutes"].sum())
-            rows.append(row)
-    return pd.DataFrame(rows)
 
 
 def diversity(runs) -> pd.DataFrame:
@@ -673,7 +558,7 @@ def analyze(make_plots: bool = True) -> dict:
     if not runs:
         raise FileNotFoundError(
             f"no finished runs under {config.TEST_DIR} — run "
-            f"scripts/04_run_test.py first")
+            f"drift_ensemble/scripts/04_run_test.py first")
     td = tables_dir()
     out: dict[str, pd.DataFrame] = {}
     failures: list[str] = []
@@ -708,8 +593,6 @@ def analyze(make_plots: bool = True) -> dict:
     section("delay_curve", delay_curve_table, runs)
     section("per_type_mixed", per_type_mixed, runs)
     section("first_to_fire", first_to_fire, runs)
-    section("verification_confusion", verification_confusion, runs)
-    section("verification_summary", verification_summary, runs)
     section("diversity", diversity, runs)
     section("significance", significance, metrics)
     section("sensitivity_summary", sensitivity_summary, runs)

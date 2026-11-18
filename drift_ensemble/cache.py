@@ -1,4 +1,4 @@
-"""HT error cache (PHASE 3).
+"""HT error cache.
 
 HT is never reset and the detectors never influence it, so HT's 0/1 error
 sequence on a stream is the same whatever detector is attached. It is
@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from drift_ensemble import config
-from drift_ensemble.streams import make_stream, stream_id
+from streams import make_stream, stream_id
 
 
 def stream_cache_dir(sid: str):
@@ -48,8 +48,8 @@ def cache_stream(
     from capymoa.classifier import HoeffdingTree
 
     t0 = time.perf_counter()
-    stream, ground_truth, plan = make_stream(generator, mode, seed,
-                                             **plan_overrides)
+    stream, ground_truth, plan = make_stream(
+        generator, mode, seed, **{**config.STREAM_SIZES, **plan_overrides})
     n = plan["length"]
     ht = HoeffdingTree(schema=stream.get_schema())
     errors = np.full(n, -1, dtype=np.int8)
@@ -97,8 +97,8 @@ def load_cache(sid: str) -> tuple[np.ndarray, list[dict], dict]:
     d = stream_cache_dir(sid)
     if not is_cached(sid):
         raise FileNotFoundError(
-            f"stream {sid!r} is not cached yet — run scripts/01 (tuning) or "
-            f"scripts/04 (test) first"
+            f"stream {sid!r} is not cached yet — run "
+            f"drift_ensemble/scripts/01 (tuning) or 04 (test) first"
         )
     errors = np.load(d / "errors.npy")
     ground_truth = json.loads((d / "ground_truth.json").read_text())

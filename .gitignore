@@ -4,12 +4,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Regenerable outputs of the detector study (scripts 01-05).
-# results/tuning/ IS tracked: selected_params.json is needed to run anything.
-results/cache/
-results/test/
-results/analysis/
+# Regenerable outputs of the drift-ensemble experiment.
+# results/results_drift_ensemble/tuning/ IS tracked: selected_params.json
+# (the tuned detector params) is needed to run either experiment.
+results/results_drift_ensemble/cache/
+results/results_drift_ensemble/test/
+results/results_drift_ensemble/analysis/
 
-# Outputs of the DDD experiment. To bring VM results back through git:
-#   git add -f ensemble_experiment/results/runs
-ensemble_experiment/results/
+# Outputs of the extended-DDD experiment.
+results/results_ensemble/

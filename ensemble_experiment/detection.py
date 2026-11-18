@@ -3,7 +3,8 @@
 A signal exposes ``update(t, err) -> bool`` (True = drift alarm at t),
 ``reset()`` and the logs ``alarms``, ``raw_fires`` and ``logs``. The
 detectors run with the params tuned for their cluster
-(results/tuning/selected_params.json), exactly as in the detector study.
+(results/results_drift_ensemble/tuning/selected_params.json), exactly as
+in the detector study.
 
 reset() wipes every detector's statistics (and pending cluster votes) but
 keeps what an ensemble has learned about its detectors: cluster_vote
@@ -27,8 +28,8 @@ def load_selected_params(path=None) -> dict:
     path = config.SELECTED_PARAMS_PATH if path is None else path
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} not found — run the detector study's "
-            f"scripts/03_select_params.py first")
+            f"{path} not found — run the drift-ensemble experiment's "
+            f"drift_ensemble/scripts/03_select_params.py first")
     return json.loads(path.read_text())
 
 

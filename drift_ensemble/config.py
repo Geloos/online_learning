@@ -1,9 +1,12 @@
-"""Central configuration. Every hyperparameter of the study lives here.
+"""Configuration of the drift-ensemble experiment. Every hyperparameter of
+this study lives here (the stream generators themselves are defined in the
+shared root module streams.py).
 
 Importing this module also sets JAVA_HOME (needed by capymoa) — modules that
 import capymoa must import drift_ensemble.config first.
 """
 
+import sys
 from pathlib import Path
 
 from drift_ensemble._java import ensure_java_home
@@ -14,30 +17,31 @@ ensure_java_home()
 # Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_ROOT / "results"
+if str(PROJECT_ROOT) not in sys.path:  # the shared streams.py lives there
+    sys.path.insert(0, str(PROJECT_ROOT))
+RESULTS_DIR = PROJECT_ROOT / "results" / "results_drift_ensemble"
 CACHE_DIR = RESULTS_DIR / "cache"
 TUNING_DIR = RESULTS_DIR / "tuning"
 TEST_DIR = RESULTS_DIR / "test"
 ANALYSIS_DIR = RESULTS_DIR / "analysis"
 
 # ---------------------------------------------------------------------------
-# Streams
+# Streams (built by the shared streams.py)
 # ---------------------------------------------------------------------------
 GENERATORS = ["Agrawal", "SEA", "STAGGER"]
-FUNCTIONS = {
-    "SEA": [1, 2, 3, 4],
-    "Agrawal": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-    "STAGGER": [1, 2, 3],
-}
-N_DRIFTS = 30
+N_DRIFTS = 30  # MIXED streams: half abrupt, half gradual (15 / 15)
 DRIFT_EVERY_N = 10_000
 GRADUAL_WIDTH = 2_000
-MIXED_SPLIT = (15, 15)  # (abrupt, gradual) drifts in a MIXED stream
+STREAM_SIZES = {
+    "n_drifts": N_DRIFTS,
+    "drift_every_n": DRIFT_EVERY_N,
+    "gradual_width": GRADUAL_WIDTH,
+}
 # All 3 generators (15 MIXED test streams, was Agrawal only = 5): with 5
 # pairs Wilcoxon cannot reach p < 0.0625, so MIXED could never be significant.
 MIXED_GENERATORS = ["Agrawal", "SEA", "STAGGER"]
-INIT_FUNCTION = 1
 MODES = ["ABRUPT", "GRADUAL", "MIXED"]
+PURE_MODES = ("ABRUPT", "GRADUAL")  # tuning uses the pure modes only
 
 # ---------------------------------------------------------------------------
 # Seeds (tuning and test seeds must never overlap — asserted below)
@@ -45,6 +49,18 @@ MODES = ["ABRUPT", "GRADUAL", "MIXED"]
 TUNING_SEEDS = [1, 2, 3]
 TEST_SEEDS = [101, 102, 103, 104, 105]
 assert not set(TUNING_SEEDS) & set(TEST_SEEDS), "tuning and test seeds overlap"
+
+
+def tuning_stream_specs() -> list[tuple[str, str, int]]:
+    return [(g, mode, s) for g in GENERATORS for mode in PURE_MODES
+            for s in TUNING_SEEDS]
+
+
+def test_stream_specs() -> list[tuple[str, str, int]]:
+    pure = [(g, mode, s) for g in GENERATORS for mode in PURE_MODES
+            for s in TEST_SEEDS]
+    mixed = [(g, "MIXED", s) for g in MIXED_GENERATORS for s in TEST_SEEDS]
+    return pure + mixed
 
 # ---------------------------------------------------------------------------
 # Learner / detection
@@ -87,7 +103,7 @@ TUNING_GRIDS = {
 }
 
 # ---------------------------------------------------------------------------
-# Clusters (membership justified by results/tuning/tuning_summary.csv)
+# Clusters (membership justified by tuning/tuning_summary.csv)
 # Abrupt-cluster detectors run with their ABRUPT-tuned params, gradual-cluster
 # detectors with their GRADUAL-tuned params (see selected_params.json).
 #
@@ -108,16 +124,6 @@ CLUSTER_MEMBERS = {
 # Fixed tie-break order for choosing the trigger when several detectors fire
 # on the same instance.
 DETECTOR_ORDER = ["STEPD", "SEED", "HDDMWeighted", "RDDM"]
-
-# ---------------------------------------------------------------------------
-# Verification (chosen by the cluster of the TRIGGER detector)
-# N = training samples per NB model, D = gap skipped before the alarm,
-# E = unseen test samples.
-# ---------------------------------------------------------------------------
-VERIFY = {
-    "ABRUPT": {"N": 250, "D": 250, "E": 250, "alpha": 0.05},
-    "GRADUAL": {"N": 500, "D": 500, "E": 500, "alpha": 0.05},
-}
 
 # ---------------------------------------------------------------------------
 # Cluster-vote ensemble (ens_cluster_vote): a drift needs two votes from the
@@ -162,19 +168,12 @@ SENS = {
     "RDDM_LEVEL_MIN": 1.0,
 }
 
-# ---------------------------------------------------------------------------
-# Weights
-# ---------------------------------------------------------------------------
-W_INIT = 1.0
-BETA = 0.5
-W_MIN = 0.5  # muted when w <= W_MIN (one strike with BETA = 0.5)
-
-# Phase 0.4 probe result (capymoa 0.9.0, fed 2000x0, 500x1, 2000x0, 500x1):
-# every detector fired again after its first detection WITHOUT an explicit
+# Probe result (capymoa 0.9.0, fed 2000x0, 500x1, 2000x0, 500x1): every
+# detector fired again after its first detection WITHOUT an explicit
 # reset() call, i.e. all four restart their own statistics after
 # detected_change() is True. So "reset only the signaling detector" already
-# happens by itself in every method; the *_resetall methods add the explicit
-# reset of ALL detectors (via ensemble.reset_detector).
+# happens by itself in every method; ens_raw_resetall and the cluster
+# ensembles add the explicit reset of ALL detectors (ensemble.reset_detector).
 DETECTOR_SELF_RESETS = {
     "STEPD": True,
     "SEED": True,
@@ -198,12 +197,13 @@ METHODS = [
 
 def snapshot() -> dict:
     """The config values that define an experiment, for meta.json files."""
+    import streams
+
     return {
         "N_DRIFTS": N_DRIFTS,
         "DRIFT_EVERY_N": DRIFT_EVERY_N,
         "GRADUAL_WIDTH": GRADUAL_WIDTH,
-        "MIXED_SPLIT": list(MIXED_SPLIT),
-        "INIT_FUNCTION": INIT_FUNCTION,
+        "INIT_FUNCTION": streams.INIT_FUNCTION,
         "MIN_TRAINING_SIZE": MIN_TRAINING_SIZE,
         "MAX_DELAY": MAX_DELAY,
         "DELAY_GRID": DELAY_GRID,
@@ -213,19 +213,6 @@ def snapshot() -> dict:
         "GRID_SAMPLE_SEED": GRID_SAMPLE_SEED,
         "CLUSTER_MEMBERS": CLUSTER_MEMBERS,
         "DETECTOR_ORDER": DETECTOR_ORDER,
-        "VERIFY": VERIFY,
         "VOTE": VOTE,
         "SENS": SENS,
-        "W_INIT": W_INIT,
-        "BETA": BETA,
-        "W_MIN": W_MIN,
-        "USE_CACHED_ERRORS_FOR_TEST_RUNS": USE_CACHED_ERRORS_FOR_TEST_RUNS,
     }
-
-
-# Engineering choice (validated by tests/test_cache_replay.py): HT is
-# deterministic given the instance sequence, so test runs read the 0/1 error
-# sequence from the per-stream cache instead of re-running HT inside every
-# method. Verified-ensemble runs still iterate the real stream for the NB
-# verification models.
-USE_CACHED_ERRORS_FOR_TEST_RUNS = True

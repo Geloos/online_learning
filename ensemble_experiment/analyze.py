@@ -3,6 +3,7 @@
     .venv\\Scripts\\python.exe ensemble_experiment/analyze.py
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from ensemble_experiment.analysis import run_analysis  # noqa: E402
 
 
 def main() -> None:
+    argparse.ArgumentParser(description=__doc__.split("\n")[0]).parse_args()
     summary = run_analysis()
     if summary.empty:
         return

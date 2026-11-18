@@ -1,6 +1,6 @@
 """Cached HT errors must reproduce a live prequential run exactly: the same
 stream seed gives the same HT, so detector alarms replayed from the cache
-equal the alarms of a detector attached to a live HT run (PHASE 10)."""
+equal the alarms of a detector attached to a live HT run."""
 
 import pytest
 

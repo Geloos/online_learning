@@ -1,21 +1,14 @@
-"""Verified heterogeneous detector ensemble (PHASE 8).
+"""Error-driven drift-detector ensembles.
 
-The ensemble is written against duck-typed components so the state machine is
-unit-testable without a JVM:
+The ensembles are written against duck-typed detectors so the state
+machines are unit-testable without a JVM: a detector needs
+``add_element(float)``, ``detected_change() -> bool`` and ``reset()``.
 
-* detectors need ``add_element(float)`` and ``detected_change() -> bool``
-  (and ``reset()`` in the *_resetall and cluster-vote methods),
-* the NB factory and instances follow the contract in verifier.py.
-
-The Hoeffding Tree lives outside: the caller runs the prequential loop and
-passes each instance plus the HT 0/1 error to ``update``.
+The Hoeffding Tree lives outside: the caller runs the prequential loop (or
+replays the cached HT errors) and passes each 0/1 error to ``update``.
 """
 
 from __future__ import annotations
-
-from collections import deque
-
-from drift_ensemble.verifier import CONFIRMED, FALSE_ALARM, Verification
 
 
 def reset_detector(det) -> None:
@@ -29,160 +22,11 @@ def reset_detector(det) -> None:
         moa.resetLearning()
 
 
-class VerifiedDetectorEnsemble:
-    """OR-ensemble of drift detectors with McNemar verification and
-    mute/unmute weighting. Detection only — nothing is adapted or reset,
-    except the optional reset_all_on_confirm ablation (ens_verified_resetall):
-    a CONFIRMED verdict then resets ALL detectors, on the grounds that their
-    statistics span a real concept change and are stale. False alarms never
-    reset anything — they only mute the trigger."""
-
-    def __init__(
-        self,
-        detectors: dict[str, object],  # name -> detector instance
-        clusters: dict[str, str],  # name -> 'ABRUPT' | 'GRADUAL'
-        order: list[str],  # fixed tie-break order
-        verify_cfg: dict,  # cluster -> {'N', 'D', 'E', 'alpha'}
-        nb_factory,  # () -> fresh NB model
-        w_init: float = 1.0,
-        beta: float = 0.5,
-        w_min: float = 0.25,
-        reset_all_on_confirm: bool = False,
-    ):
-        assert set(order) == set(detectors) == set(clusters)
-        self.detectors = detectors
-        self.clusters = clusters
-        self.order = list(order)
-        self.verify_cfg = verify_cfg
-        self.nb_factory = nb_factory
-        self.beta = beta
-        self.w_min = w_min
-        self.reset_all_on_confirm = reset_all_on_confirm
-
-        self.weights = {name: w_init for name in order}
-        self.muted = {name: False for name in order}
-        self.verification: Verification | None = None
-
-        buflen = max(cfg["N"] + cfg["D"] for cfg in verify_cfg.values())
-        self.buffer: deque = deque(maxlen=buflen)
-
-        # Logs
-        self.raw_fires: list[dict] = []  # every detector fire, muted or not
-        self.ensemble_alarms: list[int] = []  # the ensemble's alarm output
-        self.verifications: list[dict] = []  # finished verification records
-        self.weights_log: list[dict] = []  # every weight/mute change
-        self.ties: list[dict] = []  # >1 detector fired on the same instance
-
-    # ------------------------------------------------------------------
-    def observe(self, t: int, instance) -> None:
-        """Buffer-only update for the warm-up period (t < MIN_TRAINING_SIZE),
-        so the pre-alarm buffer is full when the first alarm can occur."""
-        self.buffer.append((t, instance))
-
-    def update(self, t: int, instance, err: int) -> None:
-        """One prequential step after HT predicted: ``err`` is HT's 0/1 error
-        on ``instance``. Called for every instance once detection is active."""
-        # 1. Buffer the instance; advance a running verification.
-        self.buffer.append((t, instance))
-        finished = False
-        if self.verification is not None:
-            finished = self.verification.step(t, instance)
-
-        # 2. Feed the error to ALL detectors, muted ones included.
-        fired = []
-        for name in self.order:
-            det = self.detectors[name]
-            det.add_element(float(err))
-            if det.detected_change():
-                fired.append(name)
-        for name in fired:
-            self.raw_fires.append(
-                {"t": t, "detector": name, "muted_at_fire": self.muted[name]}
-            )
-        if len(fired) > 1:
-            self.ties.append({"t": t, "fired": list(fired)})
-
-        # 3. While a verification is running (including the instance on which
-        #    it finishes): fires only join its co-fired list. No alarm output,
-        #    no new verification.
-        if self.verification is not None:
-            if fired:
-                for name in fired:
-                    self.verification.add_cofired(t, name)
-        # 4. Otherwise one firing detector is enough to act.
-        elif fired:
-            unmuted = [n for n in fired if not self.muted[n]]
-            if unmuted:
-                trigger, shadow = unmuted[0], False
-                self.ensemble_alarms.append(t)
-            else:  # all fired detectors are muted -> shadow verification
-                trigger, shadow = fired[0], True
-            cluster = self.clusters[trigger]
-            cfg = self.verify_cfg[cluster]
-            self.verification = Verification(
-                t_alarm=t,
-                trigger=trigger,
-                cluster=cluster,
-                n_train=cfg["N"],
-                gap=cfg["D"],
-                n_test=cfg["E"],
-                alpha=cfg["alpha"],
-                shadow=shadow,
-                nb_factory=self.nb_factory,
-                buffer=self.buffer,
-            )
-            for name in fired:
-                if name != trigger:
-                    self.verification.add_cofired(t, name)
-
-        # 5. Apply the verdict of a verification that finished at t.
-        if finished:
-            self._apply_verdict(t)
-
-    # ------------------------------------------------------------------
-    def _apply_verdict(self, t: int) -> None:
-        v = self.verification
-        self.verification = None
-        self.verifications.append(v.record())
-        if v.verdict == CONFIRMED:
-            # Trigger and every co-fired detector: full weight, unmuted.
-            for name in sorted({v.trigger} | v.cofired_names,
-                               key=self.order.index):
-                self.weights[name] = 1.0
-                self.muted[name] = False
-                self._log_weight(t, name)
-            # Ablation: a confirmed concept change makes every detector's
-            # statistics stale -> wipe them all (shadow confirms included).
-            if self.reset_all_on_confirm:
-                self._reset_detectors()
-        elif v.verdict == FALSE_ALARM:
-            # Only the trigger is penalized, and only if it is not muted
-            # (a shadow trigger stays where it is). Co-fired detectors are
-            # never penalized.
-            name = v.trigger
-            if not self.muted[name]:
-                self.weights[name] *= self.beta
-                if self.weights[name] <= self.w_min:
-                    self.muted[name] = True
-                self._log_weight(t, name)
-        # INCONCLUSIVE: nothing changes.
-
-    def _log_weight(self, t: int, name: str) -> None:
-        self.weights_log.append(
-            {"t": t, "detector": name,
-             "w": self.weights[name], "muted": self.muted[name]}
-        )
-
-    def _reset_detectors(self) -> None:
-        for det in self.detectors.values():
-            reset_detector(det)
-
-
 class RawResetAllEnsemble:
-    """Ablation: OR of all detectors with the classic trusting response —
-    every fire is an alarm and resets ALL detectors ("drift detected, okay,
-    reset"). No verification, no muting, no silence window. The counterpart
-    "reset only the signaler" needs no class of its own: it is ens_raw,
+    """OR of all detectors with the classic trusting response — every fire
+    is an alarm and resets ALL detectors ("drift detected, okay, reset").
+    The counterpart "reset only the signaler" needs no class of its own: it
+    is ens_raw,
     because capymoa detectors restart their own statistics after firing
     (DETECTOR_SELF_RESETS). Error-driven only (no instances)."""
 
@@ -234,8 +78,7 @@ class ClusterVoteEnsemble:
     earlier voter of a confirming pair gains ``step`` scaled by how much
     earlier it fired, the later voter loses the same amount; weights are
     clamped to [w_floor, w_max]. A detector whose weight reached ``w_max``
-    may signal drift for its cluster alone. Error-driven only (no
-    instances, no verification)."""
+    may signal drift for its cluster alone. Error-driven only."""
 
     def __init__(self, detectors, clusters, order, *, window, w_init,
                  w_max, w_floor, step):
@@ -262,8 +105,7 @@ class ClusterVoteEnsemble:
 
     def _log_weight(self, t: int, name: str) -> None:
         self.weights_log.append(
-            {"t": t, "detector": name,
-             "w": self.weights[name], "muted": False}
+            {"t": t, "detector": name, "w": self.weights[name]}
         )
 
     def _reward_pair(self, t: int, *, first: str, t_first: int) -> None:
@@ -422,37 +264,3 @@ class ClusterSensitivityEnsemble:
         if alarmed:
             self.alarms.append(t)
             _reset_all(self)
-
-
-class CooldownEnsemble:
-    """Ablation: OR of all detectors plus the SAME 'ignore alarms for N+E
-    instances after an alarm' window as the full method — but no
-    verification and no muting. Separates the effect of verification from
-    the effect of the cooldown window. Error-driven only (no instances)."""
-
-    def __init__(self, detectors, clusters, order, verify_cfg):
-        assert set(order) == set(detectors) == set(clusters)
-        self.detectors = detectors
-        self.clusters = clusters
-        self.order = list(order)
-        self.verify_cfg = verify_cfg
-        self.cooldown_until = -1  # alarms suppressed while t <= cooldown_until
-        self.alarms: list[int] = []
-        self.raw_fires: list[dict] = []
-
-    def update(self, t: int, err: int) -> None:
-        fired = []
-        for name in self.order:
-            det = self.detectors[name]
-            det.add_element(float(err))
-            if det.detected_change():
-                fired.append(name)
-        for name in fired:
-            self.raw_fires.append({"t": t, "detector": name})
-        if fired and t > self.cooldown_until:
-            trigger = fired[0]
-            cfg = self.verify_cfg[self.clusters[trigger]]
-            self.alarms.append(t)
-            # Matches the full method: a verification started at t keeps the
-            # ensemble silent for t+1 .. t+N+E inclusive.
-            self.cooldown_until = t + cfg["N"] + cfg["E"]

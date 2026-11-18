@@ -1,14 +1,19 @@
-"""PHASE 5: evaluate every detector config on every cached tuning stream.
+"""Evaluate every detector config on every cached tuning stream.
 
 Appends one row per (detector, config, stream) to
-results/tuning/tuning_runs.csv. Resumable: finished configs are skipped.
+results/results_drift_ensemble/tuning/tuning_runs.csv. Resumable: finished
+configs are skipped.
 """
 
 import argparse
 import csv
 import time
+import sys
+from pathlib import Path
 
-import _common
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
+
+from drift_ensemble import cli  # noqa: E402
 
 
 def _load_done_counts(path, n_fields) -> dict:
@@ -33,7 +38,7 @@ def _append_rows(path, fields, rows) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--workers", type=int, default=_common.default_workers())
+    ap.add_argument("--workers", type=int, default=cli.default_workers())
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--limit", type=int, default=None,
                     help="only run the first N configs (smoke testing)")
@@ -55,7 +60,7 @@ def main() -> None:
     if missing:
         raise SystemExit(
             f"{len(missing)} tuning streams are not cached yet "
-            f"(e.g. {missing[0]}) — run scripts/01_cache_tuning_streams.py "
+            f"(e.g. {missing[0]}) — run drift_ensemble/scripts/01_cache_tuning_streams.py "
             f"first")
 
     tasks = all_tasks()
@@ -80,7 +85,7 @@ def main() -> None:
     if not remaining:
         print(f"Done — {TUNING_RUNS_CSV}")
         return
-    _common.gate(unit, len(remaining), args.workers, args.yes, "config")
+    cli.gate(unit, len(remaining), args.workers, args.yes, "config")
 
     start = time.perf_counter()
     if args.workers > 1:
@@ -96,7 +101,7 @@ def main() -> None:
                     elapsed = time.perf_counter() - start
                     eta = elapsed / i * (len(remaining) - i)
                     print(f"  [{i}/{len(remaining)}] configs done "
-                          f"(ETA {_common.fmt_duration(eta)})")
+                          f"(ETA {cli.fmt_duration(eta)})")
     else:
         for i, task in enumerate(remaining, 1):
             _append_rows(TUNING_RUNS_CSV, ROW_FIELDS, run_task(task))
@@ -104,7 +109,7 @@ def main() -> None:
                 elapsed = time.perf_counter() - start
                 eta = elapsed / i * (len(remaining) - i)
                 print(f"  [{i}/{len(remaining)}] configs done "
-                      f"(ETA {_common.fmt_duration(eta)})")
+                      f"(ETA {cli.fmt_duration(eta)})")
     print(f"Done — {TUNING_RUNS_CSV}")
 
 

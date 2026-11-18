@@ -1,4 +1,4 @@
-"""Parameter selection from tuning runs (PHASE 6).
+"""Parameter selection from tuning runs.
 
 For each detector and each mode (ABRUPT, GRADUAL) separately: the config
 with the highest mean TUNE_OBJECTIVE over all tuning streams of that mode
@@ -12,7 +12,7 @@ import json
 import pandas as pd
 
 from drift_ensemble import config
-from drift_ensemble.streams import PURE_MODES
+from drift_ensemble.config import PURE_MODES
 
 METRIC_COLS = ["f1", "f2", "precision", "recall", "mean_delay", "far",
                "delay_auc"]

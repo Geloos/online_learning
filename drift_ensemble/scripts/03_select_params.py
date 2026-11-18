@@ -1,14 +1,18 @@
-"""PHASE 6: pick the best config per detector x mode from tuning_runs.csv.
+"""Pick the best config per detector x mode from tuning_runs.csv.
 
-Writes results/tuning/selected_params.json, tuning_summary.csv (the table
-that justifies the cluster assignment) and logo_check.csv (leave-one-
-generator-out robustness check).
+Writes results/results_drift_ensemble/tuning/selected_params.json,
+tuning_summary.csv (the table that justifies the cluster assignment) and
+logo_check.csv (leave-one-generator-out robustness check).
 """
 
 import argparse
 import json
+import sys
+from pathlib import Path
 
-import _common  # noqa: F401  (sys.path bootstrap)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
+
+from drift_ensemble import cli  # noqa: E402
 
 
 def main() -> None:

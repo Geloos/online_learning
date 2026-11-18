@@ -1,4 +1,4 @@
-"""Alarm <-> drift matching and detection metrics (PHASE 4).
+"""Alarm <-> drift matching and detection metrics.
 
 The same matching rule is used everywhere: tuning, single detectors and the
 ensemble.

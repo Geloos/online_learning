@@ -4,21 +4,20 @@ warm-up, delay window, vote/sensitivity settings) are re-exported from
 drift_ensemble.config so the two experiments cannot silently diverge.
 
 Importing this module imports drift_ensemble.config first, which sets
-JAVA_HOME (needed by capymoa).
+JAVA_HOME (needed by capymoa) and puts the repo root (home of the shared
+streams.py) on sys.path.
 """
-
-from pathlib import Path
 
 from drift_ensemble import config as base
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-EXPERIMENT_DIR = Path(__file__).resolve().parent
-RESULTS_DIR = EXPERIMENT_DIR / "results"
+RESULTS_DIR = base.PROJECT_ROOT / "results" / "results_ensemble"
 RUNS_DIR = RESULTS_DIR / "runs"
 ANALYSIS_DIR = RESULTS_DIR / "analysis"
-# Detector params tuned by the detector study (scripts/03_select_params.py).
+# Detector params tuned by the drift-ensemble experiment
+# (drift_ensemble/scripts/03_select_params.py).
 SELECTED_PARAMS_PATH = base.TUNING_DIR / "selected_params.json"
 
 # ---------------------------------------------------------------------------
@@ -46,17 +45,18 @@ DDD = {
 }
 
 # ---------------------------------------------------------------------------
-# Streams: the detector study's generators, shortened (DDD runs live).
+# Streams (shared streams.py): the drift-ensemble experiment's generators,
+# shorter streams (DDD runs live), plus the RECURRING mode.
 # ---------------------------------------------------------------------------
 GENERATORS = list(base.GENERATORS)
-FUNCTIONS = base.FUNCTIONS
 MODES = ["ABRUPT", "GRADUAL", "MIXED", "RECURRING"]
-STREAM_OVERRIDES = {
+RECURRING_N_CONCEPTS = 3  # concepts revisited in a RECURRING stream
+STREAM_SIZES = {  # streams.plan_stream keyword arguments
     "n_drifts": 8,
     "drift_every_n": 5_000,
     "gradual_width": 1_000,
+    "n_concepts": RECURRING_N_CONCEPTS,  # used by RECURRING only
 }
-RECURRING_N_CONCEPTS = 3  # concepts revisited in a RECURRING stream
 
 # ---------------------------------------------------------------------------
 # Seeds (disjoint from the detector study's tuning and test seeds)
@@ -92,14 +92,15 @@ LOG_EVERY = 100  # steps.csv keeps every LOG_EVERY-th step
 
 def snapshot() -> dict:
     """The values that define a run, stored in each run's meta.json."""
+    import streams
+
     return {
         "DDD": DDD,
-        "STREAM_OVERRIDES": STREAM_OVERRIDES,
-        "RECURRING_N_CONCEPTS": RECURRING_N_CONCEPTS,
+        "STREAM_SIZES": STREAM_SIZES,
         "MIN_TRAINING_SIZE": MIN_TRAINING_SIZE,
         "MAX_DELAY": MAX_DELAY,
         "DUPLICATES_AS_FP": DUPLICATES_AS_FP,
-        "INIT_FUNCTION": base.INIT_FUNCTION,
+        "INIT_FUNCTION": streams.INIT_FUNCTION,
         "CLUSTER_MEMBERS": base.CLUSTER_MEMBERS,
         "DETECTOR_ORDER": base.DETECTOR_ORDER,
         "VOTE": base.VOTE,

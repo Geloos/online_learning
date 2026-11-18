@@ -1,17 +1,19 @@
-"""PHASE 9 step 1: cache HT errors for the 45 test streams, then run every
-method on every test stream (resumable; one JVM per worker)."""
+"""Cache HT errors for the 45 test streams, then run every method on every
+test stream (resumable; one JVM per worker)."""
 
 import argparse
 import time
+import sys
+from pathlib import Path
 
-import _common
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
 
-VERIFIED = ("ens_verified", "ens_verified_resetall")
+from drift_ensemble import cli  # noqa: E402
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--workers", type=int, default=_common.default_workers())
+    ap.add_argument("--workers", type=int, default=cli.default_workers())
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--methods", default=None,
                     help="comma-separated subset of methods to run")
@@ -20,13 +22,14 @@ def main() -> None:
     from drift_ensemble import config
     from drift_ensemble.runio import is_run_done, load_selected_params
     from drift_ensemble.runio import run_and_save
-    from drift_ensemble.streams import stream_id, test_stream_specs
+    from drift_ensemble.config import test_stream_specs
+    from streams import stream_id
 
     load_selected_params()  # fail fast with a clear message if 02/03 not run
 
     specs = test_stream_specs()
     print(f"Cache dir: {config.CACHE_DIR}")
-    _common.cache_streams(specs, args.workers, args.yes, "test streams")
+    cli.cache_streams(specs, args.workers, args.yes, "test streams")
 
     methods = (args.methods.split(",") if args.methods else config.METHODS)
     unknown = set(methods) - set(config.METHODS)
@@ -44,37 +47,18 @@ def main() -> None:
         return
     config.TEST_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Time one unit of each kind (verified runs iterate the full stream and
-    # are far slower than cached replays), then confirm the estimate.
-    slow = [u for u in units if u[3] in VERIFIED]
-    fast = [u for u in units if u[3] not in VERIFIED]
-    unit_fast = unit_slow = 0.0
-    if fast:
-        t0 = time.perf_counter()
-        run_and_save(fast[0])
-        unit_fast = time.perf_counter() - t0
-        print(f"  timed {fast[0][3]} on {stream_id(*fast[0][:3])}: "
-              f"{_common.fmt_duration(unit_fast)}")
-        fast = fast[1:]
-    if slow:
-        t0 = time.perf_counter()
-        run_and_save(slow[0])
-        unit_slow = time.perf_counter() - t0
-        print(f"  timed {slow[0][3]} on {stream_id(*slow[0][:3])}: "
-              f"{_common.fmt_duration(unit_slow)}")
-        slow = slow[1:]
-
-    remaining = slow + fast  # long runs first keeps the pool busy
+    # Time one run, then confirm the estimate for the rest.
+    t0 = time.perf_counter()
+    run_and_save(units[0])
+    unit = time.perf_counter() - t0
+    print(f"  timed {units[0][3]} on {stream_id(*units[0][:3])}: "
+          f"{cli.fmt_duration(unit)}")
+    remaining = units[1:]
     if not remaining:
         print("Done.")
         return
     workers = max(1, args.workers)
-    est = (unit_fast * len(fast) + unit_slow * len(slow)) / workers
-    print(f"Estimated remaining time: {_common.fmt_duration(est)} "
-          f"({len(slow)} verified + {len(fast)} replay runs, "
-          f"{workers} worker(s)).")
-    _common.gate(max(unit_fast, unit_slow), len(remaining), workers,
-                 args.yes, "run (upper bound per unit)")
+    cli.gate(unit, len(remaining), workers, args.yes, "run")
 
     start = time.perf_counter()
     if workers > 1:
@@ -87,16 +71,16 @@ def main() -> None:
                 elapsed = time.perf_counter() - start
                 eta = elapsed / i * (len(remaining) - i)
                 print(f"  [{i}/{len(remaining)}] {sid},{method} "
-                      f"({_common.fmt_duration(rt)}; "
-                      f"ETA {_common.fmt_duration(eta)})")
+                      f"({cli.fmt_duration(rt)}; "
+                      f"ETA {cli.fmt_duration(eta)})")
     else:
         for i, unit in enumerate(remaining, 1):
             sid, method, rt = run_and_save(unit)
             elapsed = time.perf_counter() - start
             eta = elapsed / i * (len(remaining) - i)
             print(f"  [{i}/{len(remaining)}] {sid},{method} "
-                  f"({_common.fmt_duration(rt)}; "
-                  f"ETA {_common.fmt_duration(eta)})")
+                  f"({cli.fmt_duration(rt)}; "
+                  f"ETA {cli.fmt_duration(eta)})")
     print(f"Done — results under {config.TEST_DIR}")
 
 

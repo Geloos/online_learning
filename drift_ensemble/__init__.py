@@ -1,1 +1,2 @@
-"""Verified heterogeneous drift-detector ensemble (standalone detection study)."""
+"""Experiment 1: heterogeneous drift-detector ensembles watching a
+never-reset Hoeffding Tree (detection study)."""

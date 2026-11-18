@@ -1,6 +1,6 @@
 """One run = one detection method driving ExtendedDDD on one stream.
 
-Output folder results/runs/<generator>,<mode>,<seed>,<method>/:
+Output folder results/results_ensemble/runs/<generator>,<mode>,<seed>,<method>/:
   steps.csv     every LOG_EVERY-th step (state, accuracies, weights, caps)
   correct.npy   int8 system correctness for every step
   episodes.csv  one row per detection (see logger.EPISODE_FIELDS)
@@ -24,11 +24,7 @@ from ensemble_experiment.bagging import EnsembleFactory
 from ensemble_experiment.ddd import ExtendedDDD
 from ensemble_experiment.detection import load_selected_params, make_signal
 from ensemble_experiment.logger import EPISODE_FIELDS, STEP_FIELDS, RunLogger
-from ensemble_experiment.streams import (
-    concept_ids,
-    make_experiment_stream,
-    mark_recurring,
-)
+from streams import concept_ids, mark_recurring, plan_stream, stream_from_plan
 
 _SELECTED_PARAMS: dict | None = None
 
@@ -38,6 +34,16 @@ def _selected_params() -> dict:
     if _SELECTED_PARAMS is None:
         _SELECTED_PARAMS = load_selected_params()
     return _SELECTED_PARAMS
+
+
+def run_specs(generators=None, modes=None, seeds=None, methods=None):
+    """All (generator, mode, seed, method) runs, in a fixed order."""
+    generators = config.GENERATORS if generators is None else generators
+    modes = config.MODES if modes is None else modes
+    seeds = config.SEEDS if seeds is None else seeds
+    methods = config.METHODS if methods is None else methods
+    return [(g, m, s, meth) for g in generators for m in modes
+            for s in seeds for meth in methods]
 
 
 def run_name(generator: str, mode: str, seed: int, method: str) -> str:
@@ -96,7 +102,9 @@ def run_one(generator: str, mode: str, seed: int, method: str, *,
     log_every = config.LOG_EVERY if log_every is None else log_every
 
     t0 = time.perf_counter()
-    stream, plan = make_experiment_stream(generator, mode, seed, overrides)
+    plan = plan_stream(generator, mode, seed,
+                       **{**config.STREAM_SIZES, **(overrides or {})})
+    stream = stream_from_plan(plan)
     ground_truth = mark_recurring(plan)
     concepts = concept_ids(plan)
     signal = make_signal(method, selected_params)

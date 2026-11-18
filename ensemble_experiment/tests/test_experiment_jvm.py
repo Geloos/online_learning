@@ -11,11 +11,10 @@ pytestmark = pytest.mark.jvm
 
 
 def _instances(n=600, seed=201):
-    from ensemble_experiment.streams import make_experiment_stream
+    from streams import make_stream
 
-    stream, _ = make_experiment_stream(
-        "Agrawal", "ABRUPT", seed,
-        {"n_drifts": 1, "drift_every_n": n, "gradual_width": 100})
+    stream, _, _ = make_stream("Agrawal", "ABRUPT", seed, n_drifts=1,
+                               drift_every_n=n, gradual_width=100)
     return stream.get_schema(), [stream.next_instance() for _ in range(n)]
 
 

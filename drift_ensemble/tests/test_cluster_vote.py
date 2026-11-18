@@ -5,7 +5,7 @@ call update(t, 0) once per t, so call index == t.
 """
 
 from drift_ensemble.ensemble import ClusterVoteEnsemble
-from tests.fakes import StubDetector
+from drift_ensemble.tests.fakes import StubDetector
 
 ORDER = ["STEPD", "SEED", "HDDMWeighted", "RDDM"]
 CLUSTERS = {"SEED": "ABRUPT", "RDDM": "ABRUPT",

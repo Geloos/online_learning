@@ -1,4 +1,4 @@
-"""Detector factory, tuning grids and cached-error replay (PHASE 5 support).
+"""Detector factory, tuning grids and cached-error replay.
 
 capymoa 0.9.0 constructor kwargs match the grid names from Cerqueira et al.
 one-to-one (verified against the installed package):

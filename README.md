@@ -1,239 +1,170 @@
-# Cluster Drift-Detector Ensembles on CapyMOA
+# Drift-Detector Ensembles and Extended DDD on CapyMOA
 
-A detection study. A Hoeffding Tree (HT) learns prequentially on synthetic drift streams
-and is **never reset**. Four drift detectors (STEPD, SEED, HDDMWeighted, RDDM) watch the
-HT's 0/1 error, and several ensembles combine their alarms. Every alarm is scored against
-the known drift positions (ground truth).
+This repo holds two experiments on synthetic concept-drift streams. Both use the same
+stream generator, `streams.py`.
 
-The detectors are tuned per drift type and split into two clusters based on that tuning:
-- **ABRUPT:** SEED + RDDM
-- **GRADUAL:** STEPD + HDDMWeighted
-
-The cluster ensembles raise an alarm only when both members of a cluster agree. Stream
-design and tuning grids follow Cerqueira et al.'s drift-detector benchmark (CapyMOA), but
-all code is written from scratch.
+1. **`drift_ensemble/`: detection study.** A Hoeffding Tree learns the stream and is never
+   reset. Four drift detectors (STEPD, SEED, HDDMWeighted, RDDM) watch its 0/1 error.
+   Ensembles combine their alarms. Every alarm is scored against the known drift positions.
+2. **`ensemble_experiment/`: extended DDD.** Here the learner *is* adapted. DDD (Minku &
+   Yao 2011) keeps several online-bagging ensembles of Hoeffding trees and reacts to drift.
+   It is extended with a fast/slow drift classification, an adaptive cap on the
+   after-drift phase, and a pool of past concepts that can be recalled. DDD's drift signal
+   is each of the detection methods from experiment 1, in turn.
 
 ## Setup
 
-Python 3.12 (the requirements are pinned for it) and a JDK 11+. If `JAVA_HOME` is unset, it is derived automatically from the
-`java` on PATH.
+You need Python 3.12 and a JDK on PATH. `JAVA_HOME` is derived automatically.
 
 ```
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt   # torch: CPU build is enough
-.venv\Scripts\python -m pytest                            # 86 tests, ~10 s
-.venv\Scripts\python -m pytest -m "not jvm"               # unit tests only, no JVM
+.venv/bin/python -m pip install -r requirements.txt     # Windows: .venv\Scripts\python
 ```
 
-## Pipeline
+The requirements are pinned to the versions the results were produced with. CPU-only torch
+is enough; capymoa imports torch.
 
-Run the scripts from the project root with the venv's Python.
-- **Resumable:** every script skips work that is already finished.
-- **Time estimate:** each long script times one unit of work, prints an estimate and asks
-  for confirmation. `--yes` skips the prompt.
-- **Parallelism:** `--workers N` sets the number of workers. Each worker starts its own JVM;
-  6 is a good value on 12 cores / 16 GB.
+## Running
+
+Run everything:
 
 ```
-python scripts/01_cache_tuning_streams.py   # build + cache the 18 tuning streams (one HT pass each)
-python scripts/02_tune.py                   # 242 detector configs x 18 streams -> tuning_runs.csv
-python scripts/03_select_params.py          # best config per detector x mode -> selected_params.json
-#   STOP: check that tuning_summary.csv still justifies CLUSTER_MEMBERS in config.py
-python scripts/04_run_test.py               # cache the 45 test streams, run 8 methods on each
-python scripts/05_analyze.py                # tables + plots under results/analysis/
+python main.py
 ```
 
-`04_run_test.py --methods a,b` runs only some of the methods.
+`main.py` runs the drift-ensemble pipeline (steps 1–5), then the DDD experiment (steps 6–7).
+Every step is resumable, so a re-run only does the work that is missing. Without `--yes`,
+each long step prints a time estimate and asks for confirmation.
 
-## How it works
+| `main.py` flag | Meaning |
+|---|---|
+| `--workers N` | Parallel worker processes, each with its own JVM (default 6) |
+| `--yes` | Skip every confirmation prompt |
+| `--only drift_ensemble` / `--only ensemble_experiment` | Run only one experiment |
+| `--dry-run` | Print the steps without running them |
 
-```
-streams.py ─► cache.py (HT runs ONCE per stream) ─► results/cache/<stream>/errors.npy + ground_truth.json
-                                                       │   (everything below replays these errors)
-   02 tune ─► tuning.py: every detector config on the 18 tuning streams
-   03 select ─► selection.py: best config per detector for ABRUPT and for GRADUAL -> clusters
-   04 test ─► workflow.py: each method on each of the 45 test streams -> runio.py saves alarms
-   05 analyze ─► analysis.py + evaluation.py: alarms vs ground truth -> tables, plots
-```
+Each JVM may grow to 8 GB by default. On machines with less RAM, cap it before running:
+`export CAPYMOA_JVM_ARGS="-Xmx1g -Xss10M"`.
 
-1. **Streams (`streams.py`).** SEA, Agrawal and STAGGER generators.
-   - A new concept (classification function) starts every 10,000 instances, giving 30 drifts
-     per stream.
-   - ABRUPT drifts switch instantly. GRADUAL drifts blend over 2,000 instances. MIXED
-     streams have 15 of each, in random order.
-   - The seed fixes the whole stream, so the same seed always gives the same stream.
-   - Tuning seeds (1–3) and test seeds (101–105) are kept disjoint (asserted in
-     `config.py`).
-2. **The learner (`cache.py`).** The HT predicts each instance, then trains on it
-   (prequential).
-   - The first 1,000 instances are warm-up.
-   - The detectors never touch the HT, so its 0/1 error sequence is fixed per stream. It is
-     computed once and cached.
-   - Every later step replays that cached sequence instead of re-running the HT.
-     `tests/test_cache_replay.py` proves the replay is identical to a live run.
-3. **Detectors (`detectors.py`).** A factory for the four capymoa detectors, plus the tuning
-   grids.
-   - `set_threshold` changes a detector's drift threshold mid-stream.
-   - It sets both the MOA option and the private Java field; setting only the option has no
-     effect. This is used by `ens_cluster_sens`.
-4. **Tuning and selection (`tuning.py`, `selection.py`).** Every grid config is scored on
-   the tuning streams.
-   - For each detector, the best config by mean F1 is picked separately for ABRUPT and for
-     GRADUAL.
-   - A detector joins the cluster of the mode where its tuned F1 was higher.
-   - In the ensembles, each detector runs with its own cluster's parameters.
-5. **Ensembles (`ensemble.py`).** These take error values in and give alarms out. See
-   [Methods](#methods).
-6. **Test runs (`workflow.py`, `runio.py`).** One method on one test stream gives one
-   result folder, `results/test/<generator>,<mode>,<seed>,<method>/`. It holds:
-   - `alarms.json`, `raw_fires.csv`, `weights.csv`, `sensitivity.csv`, `verifications.csv`
-   - `meta.json`, which is written last; its presence marks the run as complete.
-7. **Scoring and analysis (`evaluation.py`, `analysis.py`).**
-   - **Matching rule:** an alarm is a TP if it falls in `[drift start, drift end + MAX_DELAY]`,
-     where `MAX_DELAY = 500`.
-   - **Duplicates:** further alarms in the same window are duplicates and count as FP
-     (`n_dup` in the tables).
-   - **Other alarms** outside every window are FP.
-   - **Metrics:** precision, recall, F1, delay (instances from the drift start to the
-     matched alarm), false-alarm rate, and Wilcoxon signed-rank tests on F1.
-   - `analysis.py` reads **only** result folders and never re-runs anything.
+You can also run the steps one at a time:
 
-`config.py` holds every hyperparameter: streams, seeds, grids, clusters, `VOTE`, `SENS`,
-and the method roster. Importing it also sets `JAVA_HOME`, so any module that imports
-capymoa must import `drift_ensemble.config` first.
-
-## Methods
-
-These are the 8 methods in `config.METHODS`, each run on each of the 45 test streams
-(15 ABRUPT, 15 GRADUAL, 15 MIXED):
-
-| Method | Alarm rule | On alarm |
+| Step | Command | Flags |
 |---|---|---|
-| `single_STEPD`, `single_SEED`, `single_HDDMWeighted`, `single_RDDM` | the detector fires | the detector self-resets |
-| `ens_raw` | any detector fires (OR) | only the firing detector self-resets |
-| `ens_raw_resetall` | any detector fires (OR) | all 4 detectors reset |
-| `ens_cluster_vote` | both members of one cluster fire within `VOTE["WINDOW"]` = 250 instances, or one full-weight detector fires | all 4 reset; the earlier voter of a pair gains weight, the later one loses it (weights in [0.5, 1.0]) |
-| `ens_cluster_sens` | both members of one cluster fire within `SENS["WINDOW"]` = 250 instances | all 4 reset; the **later** voter becomes more sensitive by `LATE_STEP × gap / WINDOW` levels (cap `L_MAX` = 3). Its threshold is changed mid-stream via `set_threshold`. |
+| 1 | `python drift_ensemble/scripts/01_cache_tuning_streams.py` | `--workers`, `--yes` |
+| 2 | `python drift_ensemble/scripts/02_tune.py` | `--workers`, `--yes`, `--limit N` (first N configs only) |
+| 3 | `python drift_ensemble/scripts/03_select_params.py` | `--objective f1\|f2\|delay_auc` |
+| 4 | `python drift_ensemble/scripts/04_run_test.py` | `--workers`, `--yes`, `--methods a,b` |
+| 5 | `python drift_ensemble/scripts/05_analyze.py` | `--no-plots` |
+| 6 | `python ensemble_experiment/run_experiment.py` | `--workers`, `--yes`, `--generators`, `--modes`, `--seeds`, `--methods` |
+| 7 | `python ensemble_experiment/analyze.py` | none |
 
-The clusters never influence each other's weights or sensitivity.
+Tests: `python -m pytest` runs both suites. `python -m pytest -m "not jvm"` runs only the fast
+unit tests, which need no JVM.
 
-**Dropped methods.** `ens_verified`, `ens_verified_resetall` and `ens_cooldown` are still
-runnable through `workflow.run_method`, but they are no longer in the roster.
-- `ens_verified*` used Naive Bayes + one-sided McNemar verification (`verifier.py`).
-  It wrongly rejected about 28% of real alarms.
-- `ens_cooldown` added a silence window after each alarm.
+## What runs
 
-`analysis.py` ignores result folders of methods that are not in the roster.
+**Streams (`streams.py`).** The generators are SEA, Agrawal and STAGGER. A drift changes the
+classification function. The seed fixes the whole stream.
+
+| Mode | Drifts |
+|---|---|
+| ABRUPT | instant switches |
+| GRADUAL | blend over a window |
+| MIXED | half abrupt, half gradual, shuffled |
+| RECURRING | as MIXED, but cycling through 3 concepts, so concepts come back |
+
+**Experiment 1: drift ensemble.**
+- **Streams:** 30 drifts per stream, one every 10,000 instances; gradual drifts are 2,000
+  wide. The tree trains for 1,000 instances before the detectors start.
+- **Caching:** the tree's 0/1 error sequence is computed once per stream and cached. Every
+  detector configuration replays it.
+- **Steps:**
+  1. Cache the 18 tuning streams.
+  2. Tune each detector's grid on them, and pick the best config separately for ABRUPT and
+     for GRADUAL.
+  3. Split the detectors into two clusters by where they scored better: ABRUPT = SEED + RDDM,
+     GRADUAL = STEPD + HDDMWeighted.
+  4. Run 8 methods on 45 test streams.
+  5. Score them.
+- **Methods:**
+
+| Method | Alarm rule |
+|---|---|
+| `single_*` (×4) | the detector fires |
+| `ens_raw` | any detector fires (each self-resets) |
+| `ens_raw_resetall` | any detector fires; all 4 reset |
+| `ens_cluster_vote` | both detectors of a cluster fire within 250 instances (or one full-weight detector); the faster voter gains weight |
+| `ens_cluster_sens` | same pair rule; the slower voter is made more sensitive (its threshold is changed mid-stream) |
+
+- **Scoring:** an alarm is a true positive if it falls in `[drift start, drift end + 500]`.
+  The metrics are precision, recall, F1, delay and false-alarm rate, with Wilcoxon tests on F1.
+
+**Experiment 2: extended DDD.**
+- **Streams:** 3 generators × 4 modes × 10 seeds, with 8 drifts per stream, one every 5,000
+  instances; gradual drifts are 1,000 wide.
+- **Drift signals:** 7 detection methods from experiment 1: the 4 singles,
+  `ens_raw_resetall`, `ens_cluster_vote` and `ens_cluster_sens`. This gives 840 runs.
+- **Learner:**
+  - Each model is an online-bagging ensemble of 10 Hoeffding trees with Naive Bayes
+    adaptive leaves.
+  - After a drift alarm, up to 5 ensembles vote: new/old × low/high diversity, plus one
+    recalled from the concept pool.
+  - The after-drift phase ends when one ensemble clearly wins, or when the adaptive cap for
+    that drift kind runs out.
+- **Measured:**
+  - prequential accuracy
+  - detection F1 and delay
+  - how each after-drift phase ended
+  - fast/slow classification accuracy
+  - how often a recalled concept matches the true one
+
+All hyperparameters are in each experiment's `config.py`.
 
 ## Layout
 
 ```
-drift_ensemble/
-  config.py      every hyperparameter; also sets JAVA_HOME (import it before capymoa)
-  _java.py       derives JAVA_HOME from `java -XshowSettings:properties`
-  streams.py     stream plans (pure Python, reproducible) + capymoa DriftStream build
-  cache.py       one HT pass per stream -> errors.npy / ht_accuracy.npy / ground_truth.json
-  detectors.py   detector factory, tuning grids, cached-error replay, set_threshold
-  tuning.py      grid evaluation on cached errors (pool workers)
-  selection.py   best config per detector x mode (+ LOGO check)
-  ensemble.py    RawResetAll, ClusterVote, ClusterSensitivity (+ dropped Verified, Cooldown)
-  verifier.py    one-sided McNemar + NB verification state machine (dropped methods only)
-  workflow.py    run_method: one method on one cached test stream
-  runio.py       result-folder I/O
-  evaluation.py  alarm<->drift matching, metrics, delay curve, per-type metrics
-  analysis.py    all tables and plots (reads result folders only)
-scripts/         thin CLIs: 01 cache, 02 tune, 03 select, 04 test runs, 05 analyze
-tests/           unit tests with fake detectors (tests/fakes.py) + `jvm`-marked integration tests
-results/         cache/  tuning/  test/  analysis/{tables,plots}
+main.py                runs both experiments end to end
+streams.py             shared stream generator (all 4 modes)
+drift_ensemble/        experiment 1
+  config.py            every setting of the experiment (also sets JAVA_HOME)
+  cache.py             one tree pass per stream -> cached 0/1 errors + ground truth
+  detectors.py         detector factory, grids, mid-stream threshold control
+  tuning.py, selection.py   grid evaluation, best config per detector x mode
+  ensemble.py          raw / reset-all / cluster-vote / cluster-sens ensembles
+  workflow.py, runio.py     one method on one test stream, result folders
+  evaluation.py        alarm <-> drift matching and metrics
+  analysis.py          tables and plots (reads result folders only)
+  cli.py               shared CLI helpers (time estimate, workers)
+  scripts/             01-05 pipeline steps
+  tests/
+ensemble_experiment/   experiment 2
+  config.py            every setting of the experiment
+  bagging.py           online bagging over Hoeffding trees
+  ddd.py               extended DDD state machine
+  tracker.py, cap.py, pool.py   accuracy trackers, adaptive cap, concept pool
+  detection.py         experiment 1's methods as DDD drift signals
+  logger.py, runner.py      one run -> result folder
+  analysis.py          tables and plots (reads result folders only)
+  run_experiment.py, analyze.py   CLIs
+  tests/
+results/
+  results_drift_ensemble/   cache/  tuning/  test/  analysis/{tables,plots}
+  results_ensemble/         runs/<generator>,<mode>,<seed>,<method>/  analysis/
 ```
 
-## Tests
+Only `results/results_drift_ensemble/tuning/` is in git. It holds the tuned detector
+parameters that both experiments read. Everything else under `results/` is regenerated by
+`main.py`.
 
-The tests check the code; they are not part of the experiment.
+## capymoa 0.9.0 notes
 
-- **Unit tests** drive the ensembles with `StubDetector` fakes that fire at scripted
-  instants, so they need no JVM.
-  - Ensembles: `test_cluster_vote.py`, `test_cluster_sens.py`, `test_ensemble.py`
-  - Verifier and McNemar: `test_verifier.py`, `test_mcnemar.py`
-  - Scoring: `test_evaluation.py`
-  - Configuration: `test_config.py`
-- **`jvm`-marked tests** start real capymoa:
-  - the cached replay equals a live HT run (`test_cache_replay.py`)
-  - `reset_detector` really resets MOA state (`test_reset.py`)
-  - `set_threshold` changes sensitivity mid-stream and survives resets
-    (`test_set_threshold.py`)
-  - streams and ground truth are built correctly (`test_streams.py`)
-
-## Second experiment: extended DDD (`ensemble_experiment/`)
-
-Here the learner **is** adapted. Each model is an online-bagging ensemble of 10 Hoeffding
-trees, and DDD (Minku & Yao 2011) keeps up to 5 of them: new-low, new-high, old-low,
-old-high, and a model recalled from the concept pool. It is extended with:
-- a fast/slow drift classification,
-- an adaptive per-kind cap on the after-drift phase,
-- a concept pool of frozen past ensembles.
-
-DDD's drift signal is one of this study's detection methods. Each of 7 methods drives its
-own runs:
-- the 4 singles,
-- `ens_raw_resetall`,
-- `ens_cluster_vote`,
-- `ens_cluster_sens`.
-
-The streams are this study's generators, shortened to 8 drifts every 5,000 instances. A new
-RECURRING mode revisits 3 concepts. All parameters are in `ensemble_experiment/config.py`.
-
-The full grid is 3 generators × 4 modes × 10 seeds × 7 methods = 840 runs. Each run takes
-about 17 s.
-
-### Running it on another machine
-
-```
-git clone <repo-url> && cd <repo>
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt     # Windows: .venv\Scripts\python
-.venv/bin/python -m pytest ensemble_experiment/tests    # 47 tests
-
-# Each worker starts a JVM. capymoa lets every JVM grow to 8 GB by default; cap it.
-# If a run fails with OutOfMemoryError, raise -Xmx1g to -Xmx2g.
-export CAPYMOA_JVM_ARGS="-Xmx1g -Xss10M"                # Windows: set CAPYMOA_JVM_ARGS=-Xmx1g -Xss10M
-
-.venv/bin/python ensemble_experiment/run_experiment.py --workers N --yes   # resumable
-```
-
-- **Workers:** set N to about the number of physical cores, with roughly 1.5 GB of RAM per
-  worker.
-- **Requirements:** you need a JDK on PATH. `results/tuning/selected_params.json` (the tuned
-  detector parameters) is part of the repo.
-
-Each run writes `ensemble_experiment/results/runs/<generator>,<mode>,<seed>,<method>/`,
-which holds:
-- `correct.npy`: 0/1 correctness for every instance.
-- `meta.json`: drift ground truth and the run summary.
-- `episodes.csv`: one row per alarm.
-- `steps.csv`: the state every 100 instances.
-- `alarms.json`.
-
-The outputs are git-ignored. To bring them back through git:
-
-```
-git add -f ensemble_experiment/results/runs && git commit -m "DDD results" && git push
-```
-
-Then build the tables and plots under `ensemble_experiment/results/analysis/` with
-`python ensemble_experiment/analyze.py`.
-
-## capymoa 0.9.0 quirks
-
-These were verified by probes; do not "fix" them.
-
-- **Self-reset.** All four detectors restart their own statistics after
-  `detected_change()` (`DETECTOR_SELF_RESETS`).
-- **Full reset.** capymoa's `reset()` only clears the Python-side flags.
-  `ensemble.reset_detector` also calls MOA's `resetLearning()`.
-- **Mid-stream thresholds.** Thresholds live in private Java fields, so changing a MOA
-  option mid-stream does nothing. `set_threshold` sets the option and the field together.
-- **`GradualDrift`.** `GradualDrift(position=...)` means the drift *center*, so the code
-  passes `start`/`end` instead. Its constructor also prints a stray `None`, which is
-  suppressed.
-- **torch.** capymoa imports torch unconditionally; the CPU build is enough.
+These were verified by probes.
+- The four detectors reset their own statistics after `detected_change()`.
+- `reset()` only clears the Python side, so a full reset also calls MOA's `resetLearning()`.
+- Detector thresholds live in private Java fields: changing the MOA option alone mid-stream
+  does nothing.
+- `GradualDrift(position=...)` means the drift's center, so the code passes `start`/`end`.
+- For the DDD trees:
+  - Frozen copies use MOA's `copy()`, because Python's `deepcopy` does not duplicate the Java
+    tree.
+  - Poisson bagging trains k separate times. A single weight-k call gives different trees.

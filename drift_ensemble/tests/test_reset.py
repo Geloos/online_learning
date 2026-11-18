@@ -1,7 +1,7 @@
-"""reset_detector (used by the *_resetall methods) must really reset the MOA
-detector state: capymoa's own reset() only clears Python-side flags
-(regression test for the bug where ens_verified_resetall was identical to
-ens_verified)."""
+"""reset_detector (used by ens_raw_resetall and the cluster ensembles) must
+really reset the MOA detector state: capymoa's own reset() only clears
+Python-side flags (regression test: without resetLearning() a reset-all
+ensemble behaved exactly like one without resets)."""
 
 import pytest
 

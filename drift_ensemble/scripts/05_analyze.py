@@ -1,9 +1,13 @@
-"""PHASE 9 step 2: build every analysis table and plot from the finished
-run folders (never reruns experiments)."""
+"""Build every analysis table and plot from the finished run folders
+(never reruns experiments)."""
 
 import argparse
+import sys
+from pathlib import Path
 
-import _common  # noqa: F401  (sys.path bootstrap)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
+
+from drift_ensemble import cli  # noqa: E402
 
 
 def main() -> None:

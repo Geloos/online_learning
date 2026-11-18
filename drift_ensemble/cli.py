@@ -1,5 +1,7 @@
-"""Shared helpers for the pipeline scripts: sys.path bootstrap, the
-time-one-unit -> estimate -> confirm gate, and parallel stream caching."""
+"""Helpers shared by the command-line scripts of both experiments: the
+time-one-unit -> estimate -> confirm gate, duration formatting, the default
+worker count and parallel stream caching. Importing it also puts the repo
+root (home of the shared streams.py) on sys.path."""
 
 import os
 import sys
@@ -49,7 +51,7 @@ def cache_streams(specs, workers: int, yes: bool, label: str) -> None:
     """Resumable, optionally parallel HT-error caching for a stream set,
     with the timing gate. One JVM per spawned worker."""
     from drift_ensemble.cache import cache_stream_spec, is_cached
-    from drift_ensemble.streams import stream_id
+    from streams import stream_id
 
     pending = [s for s in specs if not is_cached(stream_id(*s))]
     print(f"{label}: {len(specs)} streams, {len(pending)} to cache.")

@@ -1,9 +1,9 @@
-"""Saving/loading of test runs (PHASE 9 I/O).
+"""Saving/loading of test runs.
 
 One run = one method on one test stream, stored under
-results/test/<generator>,<mode>,<seed>,<method>/ with alarms.json,
-verifications.csv, weights.csv, sensitivity.csv, raw_fires.csv and meta.json (written last:
-its presence marks the run as complete).
+results/results_drift_ensemble/test/<generator>,<mode>,<seed>,<method>/ with
+alarms.json, weights.csv, sensitivity.csv, raw_fires.csv and meta.json
+(written last: its presence marks the run as complete).
 """
 
 from __future__ import annotations
@@ -12,13 +12,10 @@ import csv
 import json
 
 from drift_ensemble import config
-from drift_ensemble.streams import stream_id
+from streams import stream_id
 from drift_ensemble.workflow import run_method
 
-VERIFICATION_FIELDS = ["t_alarm", "trigger", "cluster", "shadow", "N", "D",
-                       "E", "b", "c", "p", "verdict", "cofired",
-                       "t_decision"]
-WEIGHT_FIELDS = ["t", "detector", "w", "muted"]
+WEIGHT_FIELDS = ["t", "detector", "w"]
 SENS_FIELDS = ["t", "detector", "level", "threshold", "reason"]
 
 
@@ -46,19 +43,13 @@ def save_run(generator: str, mode: str, seed: int, method: str,
     (out / "alarms.json").write_text(
         json.dumps({"alarms": [int(t) for t in result["alarms"]]}))
 
-    vrows = []
-    for v in result.get("verifications", []):
-        row = dict(v)
-        row["cofired"] = "|".join(row.get("cofired", []))
-        vrows.append(row)
-    _write_csv(out / "verifications.csv", VERIFICATION_FIELDS, vrows)
     _write_csv(out / "weights.csv", WEIGHT_FIELDS,
                result.get("weights_log", []))
     _write_csv(out / "sensitivity.csv", SENS_FIELDS,
                result.get("sens_log", []))
 
     raw = result.get("raw_fires", [])
-    raw_fields = ["t", "detector", "muted_at_fire"]
+    raw_fields = ["t", "detector"]
     _write_csv(out / "raw_fires.csv", raw_fields,
                [{f: r.get(f, "") for f in raw_fields} for r in raw])
 
@@ -72,11 +63,7 @@ def save_run(generator: str, mode: str, seed: int, method: str,
         "runtime_s": result["runtime_s"],
         "n_alarms": len(result["alarms"]),
         "n_raw_fires": len(raw),
-        "n_ties": len(result.get("ties", [])),
-        "unfinished_verification": result.get("unfinished_verification",
-                                              False),
         "final_weights": result.get("final_weights"),
-        "final_muted": result.get("final_muted"),
         "final_levels": result.get("final_levels"),
         "ground_truth": result["ground_truth"],
         "selected_params": selected_params,
@@ -89,8 +76,8 @@ def load_selected_params() -> dict:
     path = config.TUNING_DIR / "selected_params.json"
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} not found — run scripts/02_tune.py and "
-            f"scripts/03_select_params.py first")
+            f"{path} not found — run drift_ensemble/scripts/02_tune.py "
+            f"and 03_select_params.py first")
     return json.loads(path.read_text())
 
 

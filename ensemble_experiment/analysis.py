@@ -1,7 +1,7 @@
 """Tables and plots of the extended-DDD experiment.
 
-Reads ONLY the run folders under results/runs/ (never re-runs streams) and
-writes to results/analysis/:
+Reads ONLY the run folders under results/results_ensemble/runs/ (never
+re-runs streams) and writes to results/results_ensemble/analysis/:
   runs.csv                          one row per run (meta.json summaries)
   summary_by_mode_method.csv        means over generators x seeds
   summary_by_generator_mode_method.csv

@@ -1,4 +1,4 @@
-"""Grid/random search of detector parameters on cached HT errors (PHASE 5).
+"""Grid/random search of detector parameters on cached HT errors.
 
 One tuning *task* = one (detector, config) pair evaluated on every tuning
 stream. Tasks are independent, so they run in a multiprocessing pool; each
@@ -14,7 +14,8 @@ from drift_ensemble import config
 from drift_ensemble.cache import load_cache
 from drift_ensemble.detectors import iter_configs, run_detector_on_errors
 from drift_ensemble.evaluation import compute_metrics, delay_curve
-from drift_ensemble.streams import stream_id, tuning_stream_specs
+from drift_ensemble.config import tuning_stream_specs
+from streams import stream_id
 
 TUNING_RUNS_CSV = config.TUNING_DIR / "tuning_runs.csv"
 ROW_FIELDS = [
