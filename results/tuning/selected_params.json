@@ -1,0 +1,44 @@
+{
+  "ABRUPT": {
+    "STEPD": {
+      "alpha_drift": 0.002,
+      "window_size": 500
+    },
+    "SEED": {
+      "alpha": 0.8,
+      "block_size": 32,
+      "delta": 0.05,
+      "epsilon_prime": 0.005
+    },
+    "HDDMWeighted": {
+      "drift_confidence": 0.0001,
+      "lambda_": 0.01,
+      "test_type": "One-sided"
+    },
+    "RDDM": {
+      "drift_level": 1.75,
+      "min_n_instances": 2000
+    }
+  },
+  "GRADUAL": {
+    "STEPD": {
+      "alpha_drift": 0.001,
+      "window_size": 1000
+    },
+    "SEED": {
+      "alpha": 0.8,
+      "block_size": 256,
+      "delta": 0.05,
+      "epsilon_prime": 0.0075
+    },
+    "HDDMWeighted": {
+      "drift_confidence": 0.01,
+      "lambda_": 0.001,
+      "test_type": "One-sided"
+    },
+    "RDDM": {
+      "drift_level": 1.9,
+      "min_n_instances": 2000
+    }
+  }
+}

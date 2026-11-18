@@ -1,0 +1,15 @@
+# Environment
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Regenerable outputs of the detector study (scripts 01-05).
+# results/tuning/ IS tracked: selected_params.json is needed to run anything.
+results/cache/
+results/test/
+results/analysis/
+
+# Outputs of the DDD experiment. To bring VM results back through git:
+#   git add -f ensemble_experiment/results/runs
+ensemble_experiment/results/
