@@ -13,9 +13,10 @@ from drift_ensemble import config as base
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-RESULTS_DIR = base.PROJECT_ROOT / "results" / "results_ensemble"
+RESULTS_DIR = base.PROJECT_ROOT / "results" / "results_ensemble"  # run outcomes
 RUNS_DIR = RESULTS_DIR / "runs"
-ANALYSIS_DIR = RESULTS_DIR / "analysis"
+# Statistics computed from the runs (analysis.py) live outside results/.
+ANALYSIS_DIR = base.PROJECT_ROOT / "statistics" / "ensemble_experiment"
 # Detector params tuned by the drift-ensemble experiment
 # (drift_ensemble/scripts/03_select_params.py).
 SELECTED_PARAMS_PATH = base.TUNING_DIR / "selected_params.json"
@@ -67,9 +68,9 @@ assert not set(SEEDS) & set(base.TEST_SEEDS), "seeds overlap test seeds"
 
 # ---------------------------------------------------------------------------
 # Detection: the error stream of DDD's new-low ensemble is watched by one of
-# the detector study's methods. ens_raw is omitted: DDD resets the whole
-# signal on every alarm (the watched model is replaced), which makes it
-# identical to ens_raw_resetall.
+# the detector study's 7 methods. There is no ens_raw: DDD resets the whole
+# signal on every alarm (the watched model is replaced), which would make it
+# identical to ens_raw_resetall (it was dropped from experiment 1 too).
 # ---------------------------------------------------------------------------
 METHODS = [
     "single_STEPD",
@@ -88,6 +89,22 @@ DUPLICATES_AS_FP = base.DUPLICATES_AS_FP
 # Logging
 # ---------------------------------------------------------------------------
 LOG_EVERY = 100  # steps.csv keeps every LOG_EVERY-th step
+
+# ---------------------------------------------------------------------------
+# Analysis only (analysis.py): recovery after a detected real drift = how
+# many instances after the detection the accuracy counted from the detection
+# first reaches `level` x the accuracy of the stable period before the drift.
+# It is checked only after `min_instances` instances (after 1 instance the
+# accuracy is 0% or 100%).
+# ---------------------------------------------------------------------------
+RECOVERY = {"level": 0.95, "min_instances": 50}
+
+# Statistics are reported for one method: the one with the best DDD
+# accuracy. acc_block = the plots show one point per block of this many
+# instances; MIXED and RECURRING plots are aligned on each drift, from `pre`
+# before to `post` after its start (their drift positions differ per seed).
+STATS = {"method": "ens_raw_resetall", "acc_block": 200,
+         "pre": 1000, "post": 5000}
 
 
 def snapshot() -> dict:

@@ -5,7 +5,6 @@ Every method runs on every test stream:
   single_STEPD / single_SEED / single_HDDMWeighted / single_RDDM
       one detector with its cluster's selected params; every raw fire is an
       alarm (replayed from the cached HT errors)
-  ens_raw        OR of all 4; each detector only self-resets
   ens_raw_resetall   OR of all 4; every alarm resets ALL detectors
                  ("drift detected, okay, reset")
   ens_cluster_vote   two votes from the same cluster within VOTE["WINDOW"]
@@ -138,19 +137,6 @@ def run_method(method: str, generator: str, mode: str, seed: int,
         alarms = run_detector_on_errors(
             name, params_for(name, selected_params), errors)
         result = {"alarms": alarms}
-    elif method == "ens_raw":
-        per_det = {
-            name: run_detector_on_errors(
-                name, params_for(name, selected_params), errors)
-            for name in config.DETECTOR_ORDER
-        }
-        fires = [{"t": t, "detector": n} for n, ts in per_det.items()
-                 for t in ts]
-        fires.sort(key=lambda r: (r["t"], config.DETECTOR_ORDER.index(
-            r["detector"])))
-        result = {"alarms": sorted({t for ts in per_det.values()
-                                    for t in ts}),
-                  "raw_fires": fires}
     elif method in ("ens_raw_resetall", "ens_cluster_vote",
                     "ens_cluster_sens"):
         ens = build_method_ensemble(method, selected_params)

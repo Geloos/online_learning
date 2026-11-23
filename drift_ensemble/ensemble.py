@@ -25,10 +25,7 @@ def reset_detector(det) -> None:
 class RawResetAllEnsemble:
     """OR of all detectors with the classic trusting response — every fire
     is an alarm and resets ALL detectors ("drift detected, okay, reset").
-    The counterpart "reset only the signaler" needs no class of its own: it
-    is ens_raw,
-    because capymoa detectors restart their own statistics after firing
-    (DETECTOR_SELF_RESETS). Error-driven only (no instances)."""
+    Error-driven only (no instances)."""
 
     def __init__(self, detectors, order):
         assert set(order) == set(detectors)

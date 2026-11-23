@@ -1,4 +1,4 @@
-"""Build the extended-DDD tables and plots from the finished run folders.
+"""Build the extended-DDD statistics (best method) from the finished runs.
 
     .venv\\Scripts\\python.exe ensemble_experiment/analyze.py
 """
@@ -19,17 +19,16 @@ from ensemble_experiment.analysis import run_analysis  # noqa: E402
 
 def main() -> None:
     argparse.ArgumentParser(description=__doc__.split("\n")[0]).parse_args()
-    summary = run_analysis()
-    if summary.empty:
+    recovery = run_analysis()
+    if recovery.empty:
         return
-    cols = ["mode", "method", "n_runs", "acc", "f1", "recall", "precision",
-            "mean_delay", "frac_after", "kind_acc", "recall_hit_rate",
-            "recall_hit_rate_older"]
     with pd.option_context("display.width", 200,
                            "display.max_columns", 20,
                            "display.float_format", "{:.3f}".format):
-        print(summary[cols].to_string(index=False))
-    print(f"\nTables and plots written to {config.ANALYSIS_DIR}")
+        print(f"{config.STATS['method']}: recovery after detected real "
+              f"drifts (medians)")
+        print(recovery.to_string(index=False))
+    print(f"\nStatistics written to {config.ANALYSIS_DIR}")
 
 
 if __name__ == "__main__":

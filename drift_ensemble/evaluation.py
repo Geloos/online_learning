@@ -117,8 +117,8 @@ def delay_curve(
     delay_grid: list[int],
     duplicates_as_fp: bool = True,
 ) -> dict:
-    """Recall and F1 for each max-delay m in the grid; delay_auc is the mean
-    recall over the grid (normalized to [0, 1])."""
+    """Precision, recall and F1 for each max-delay m in the grid; delay_auc
+    is the mean recall over the grid (normalized to [0, 1])."""
     points = []
     for m in delay_grid:
         res = match_alarms(alarms, ground_truth, m, duplicates_as_fp)
@@ -126,6 +126,7 @@ def delay_curve(
         recall = res.tp / (res.tp + res.fn) if (res.tp + res.fn) else 0.0
         points.append({
             "max_delay": m,
+            "precision": precision,
             "recall": recall,
             "f1": _fbeta(precision, recall, 1.0),
         })

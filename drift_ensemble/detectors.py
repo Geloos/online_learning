@@ -7,6 +7,12 @@ one-to-one (verified against the installed package):
     SEED(delta, block_size, epsilon_prime, alpha, ...)
     HDDMWeighted(drift_confidence, lambda_, test_type, ...)
     RDDM(min_n_instances, drift_level, ...)
+
+Screening-only detectors (config.SCREENING_GRIDS, not in the roster):
+
+    DDM(min_n_instances, out_control_level, ...)
+    HDDMAverage(drift_confidence, test_type, ...)
+    ADWIN(delta)
 """
 
 from __future__ import annotations
@@ -21,13 +27,24 @@ DETECTOR_NAMES = list(config.TUNING_GRIDS)
 
 
 def _detector_classes():
-    from capymoa.drift.detectors import HDDMWeighted, RDDM, SEED, STEPD
+    from capymoa.drift.detectors import (
+        ADWIN,
+        DDM,
+        RDDM,
+        SEED,
+        STEPD,
+        HDDMAverage,
+        HDDMWeighted,
+    )
 
     return {
         "STEPD": STEPD,
         "SEED": SEED,
         "HDDMWeighted": HDDMWeighted,
         "RDDM": RDDM,
+        "DDM": DDM,
+        "HDDMAverage": HDDMAverage,
+        "ADWIN": ADWIN,
     }
 
 
@@ -37,13 +54,15 @@ def make_detector(name: str, params: dict):
     return cls(**params)
 
 
-def iter_configs(name: str) -> list[dict]:
-    """All grid configurations for a detector, in deterministic order.
+def iter_configs(name: str, grid: dict | None = None) -> list[dict]:
+    """All grid configurations for a detector, in deterministic order
+    (``grid`` defaults to config.TUNING_GRIDS[name]).
 
     Grids larger than SEED_RANDOM_CONFIGS (only SEED: 700 combos) are
-    subsampled without replacement with a fixed seed.
+    subsampled without replacement with a fixed seed. capymoa's default
+    config (config.DEFAULT_PARAMS) is appended when the grid lacks it.
     """
-    grid = config.TUNING_GRIDS[name]
+    grid = config.TUNING_GRIDS[name] if grid is None else grid
     keys = list(grid)
     combos = [dict(zip(keys, values))
               for values in itertools.product(*(grid[k] for k in keys))]
@@ -52,6 +71,10 @@ def iter_configs(name: str) -> list[dict]:
         idx = rng.choice(len(combos), size=config.SEED_RANDOM_CONFIGS,
                          replace=False)
         combos = [combos[i] for i in sorted(idx)]
+    default = config.DEFAULT_PARAMS.get(name)
+    if (default is not None and set(default) == set(keys)
+            and default not in combos):
+        combos.append(dict(default))
     return combos
 
 

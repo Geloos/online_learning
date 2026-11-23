@@ -39,17 +39,20 @@ def _rank(group_means: pd.DataFrame, objective: str) -> pd.DataFrame:
     )
 
 
-def select_params(df: pd.DataFrame, objective: str | None = None
+def select_params(df: pd.DataFrame, objective: str | None = None,
+                  detectors: list[str] | None = None
                   ) -> tuple[dict, pd.DataFrame]:
     """Returns ({'ABRUPT': {detector: params}, 'GRADUAL': ...}, summary df).
 
     The summary has one row per detector x mode: the winning config with its
-    mean metrics over the tuning streams of that mode."""
+    mean metrics over the tuning streams of that mode. ``detectors``
+    defaults to config.DETECTOR_ORDER."""
     objective = objective or config.TUNE_OBJECTIVE
+    detectors = config.DETECTOR_ORDER if detectors is None else detectors
     selected: dict[str, dict] = {m: {} for m in PURE_MODES}
     rows = []
     for mode in PURE_MODES:
-        for detector in config.DETECTOR_ORDER:
+        for detector in detectors:
             sub = df[(df["detector"] == detector) & (df["mode"] == mode)]
             if sub.empty:
                 raise ValueError(

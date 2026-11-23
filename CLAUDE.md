@@ -43,9 +43,15 @@ and `analyze.py`. It runs each step as a subprocess and stops at the first failu
   memory here, so set `CAPYMOA_JVM_ARGS="-Xmx1g -Xss10M"`.
 
 After `03_select_params.py`, `results/results_drift_ensemble/tuning/tuning_summary.csv` must
-justify `CLUSTER_MEMBERS` in `drift_ensemble/config.py`. The current evidence-based split is
-SEED/RDDM = ABRUPT and STEPD/HDDMWeighted = GRADUAL. `main.py` prints a reminder after step 3
-but does not stop.
+justify `CLUSTER_MEMBERS` in `drift_ensemble/config.py`. Since 2026-11-20 (re-tuned with
+`MAX_DELAY = 500`) the split is HDDMWeighted/RDDM = ABRUPT and STEPD/SEED = GRADUAL.
+- A detector always runs with its cluster's params, so it goes where those params hurt it least
+  on the other stream type. The evidence is in config.py's comment and in `screening.csv`.
+- "The mode with the higher tuning F1" no longer works as a rule: with the 500 window every
+  detector scores higher on GRADUAL.
+- The old 1000-window split, its tuning files and its runs were deleted on 2026-11-23 at the
+  user's request. Don't bring them back up.
+- `main.py` prints a reminder after step 3 but does not stop.
 
 ## Critical: import order and sys.path
 
@@ -72,8 +78,14 @@ The scripts and test conftests bootstrap the root too.
 ## Experiment 1: `drift_ensemble/`
 
 `config.py` holds every hyperparameter (sizes, seeds, grids, clusters, `VOTE`, `SENS`,
-method roster). Tuning and test seeds are asserted disjoint there. Results go under
+`STATS`, method roster). Tuning and test seeds are asserted disjoint there. Results go under
 `results/results_drift_ensemble/`.
+
+There are 60 test streams: 3 generators × {ABRUPT, GRADUAL, MIXED, RECURRING} × seeds 101–105.
+- RECURRING was added on 2026-11-20. It cycles through 3 concepts (`RECURRING_N_CONCEPTS`).
+- `STREAM_SIZES["n_concepts"]` is ignored by the other modes. All 63 earlier cached plans
+  were verified unchanged.
+- Tuning still uses ABRUPT and GRADUAL only.
 
 - **`cache.py`:** runs one HT pass per stream and stores `errors.npy`, `ht_accuracy.npy` and
   `ground_truth.json` under `cache/`. HT's error sequence is deterministic given the stream,
@@ -82,11 +94,12 @@ method roster). Tuning and test seeds are asserted disjoint there. Results go un
 - **Tuning:** `detectors.py` (factory, grids, `set_threshold`) → `tuning.py` (grid × cached
   errors) → `selection.py` (best config per detector × mode, plus a LOGO check).
 - **`ensemble.py`:** `RawResetAllEnsemble`, `ClusterVoteEnsemble` and
-  `ClusterSensitivityEnsemble`. `workflow.run_method` runs the 8 roster methods
-  (`config.METHODS`):
+  `ClusterSensitivityEnsemble`. `workflow.run_method` runs the 7 roster methods
+  (`config.METHODS`), the same 7 as experiment 2:
   - `single_*` ×4.
-  - `ens_raw`: OR; each detector only self-resets.
   - `ens_raw_resetall`: OR; every alarm resets ALL detectors.
+  - (`ens_raw`, OR with self-reset only, was dropped on 2026-11-23 at the user's request
+    because DDD can't use it. Don't reintroduce it.)
   - `ens_cluster_vote`: two same-cluster votes within `VOTE["WINDOW"]` instances, or one
     full-weight vote, signal drift and reset all detectors. The earlier voter gains weight
     and the later loses it; weights are clamped to [0.5, 1.0].
@@ -98,6 +111,30 @@ method roster). Tuning and test seeds are asserted disjoint there. Results go un
 - **Outputs:** `runio.py` defines the run-folder format (alarms.json, weights.csv,
   sensitivity.csv, raw_fires.csv, meta.json). `analysis.py` reads *only* result folders and
   must never recompute from streams.
+- **Statistics:** `stats.py` is called by `05_analyze.py` after `analysis.py`. It covers all 7
+  methods and writes to `statistics/drift_ensemble/`:
+  - `runs.csv` and `delays.csv`, which has one row per detected drift;
+  - `metrics.csv`: per method × mode, the medians over runs of precision, recall and F1,
+    and the median delay over the detected drifts;
+  - `delay_curve.csv`, plus `<MODE>/delay_curve.png`: medians when every run is rescored
+    for each max delay in `STATS["delay_grid"]` (0–500, step 25). The plot shows recall
+    only (user's choice). The max delay counts from the drift END, so gradual curves start
+    above 0 at max delay 0: alarms during the 2,000-instance transition count.
+  - one folder per mode with `singles.png` (the 4 detectors) and `ensembles.png` (the 3
+    ensembles). They are bar charts of the `metrics.csv` medians: per method, precision,
+    recall and F1 bars in the top row (0–1), and the delay bar in the bottom row (in
+    instances, since it's a different unit). Both charts of a mode share the delay scale.
+  - It is a separate module from the old `analysis/` tables (significance, diversity,
+    weights), which stay in `results/`. The file is named `stats.py` rather than
+    `statistics.py` so it doesn't shadow the stdlib module.
+- **Detector screening:** `screening.py` and `scripts/screen_detectors.py` were added on
+  2026-11-20 and are not part of `main.py`. They tune DDM, HDDMAverage and ADWIN
+  (`config.SCREENING_GRIDS`, our own ranges) as single detectors on the cached errors, then
+  score them on the ABRUPT and GRADUAL test streams.
+  - The study's 4 are scored the same way, each with its params for the stream's mode.
+  - Raw rows go to `results/results_drift_ensemble/screening/`; the summary goes to
+    `statistics/drift_ensemble/screening.csv`.
+  - The roster, the clusters and the ensembles are unchanged.
 - **Scripts:** `scripts/01..05` are thin CLIs; shared CLI helpers live in `cli.py`.
 - **Tests:** in `tests/`, using `StubDetector` from `tests/fakes.py`. JVM tests carry the `jvm`
   marker.
@@ -108,8 +145,8 @@ All parameters are in `config.py`:
 - streams: 8 drifts every 5,000; 4 modes; RECURRING cycles 3 concepts
 - seeds: 201–210
 - `DDD` dict
-- 7 methods: `ens_raw` is omitted because DDD resets the whole signal on every alarm, which
-  makes it identical to `ens_raw_resetall`.
+- 7 methods, the same as experiment 1. There is no `ens_raw`: DDD resets the whole signal
+  on every alarm, which would make it identical to `ens_raw_resetall`.
 
 The full grid is 840 runs; each takes about 17 s. Results go under
 `results/results_ensemble/runs/` (`meta.json` written last means done).
@@ -120,6 +157,22 @@ The full grid is 840 runs; each takes about 17 s. Results go under
 - **`detection.py`:** wraps experiment 1's methods as signals.
 - **`logger.py`:** matches DDD's behaviour against the ground truth: TP/FP, pool concept tags
   and recall hits.
+- **`analysis.py`:** reads run folders only (`correct.npy` holds every instance, so no
+  re-runs). Writes statistics for the best method only (`config.STATS["method"]`,
+  `ens_raw_resetall`) to `statistics/ensemble_experiment/`, outside `results/`, which
+  holds only run outcomes. Per mode it writes `recovery.csv` and `drifts.csv` and plots
+  the median accuracy per 200-instance block, one dot per block (`STATS["acc_block"]`):
+  - ABRUPT and GRADUAL plots use the whole stream.
+  - MIXED and RECURRING plots are aligned on each drift, with one line for abrupt and one
+    for gradual drifts, because their drift positions differ per seed.
+
+  Recovery (`config.RECOVERY`) uses only real drifts and the TP alarm that detected each one.
+  It reports medians of:
+  - accuracy over the stable period before the drift (from the previous drift's end, or
+    from the end of warm-up);
+  - accuracy from the drift to the detection;
+  - instances after the detection until the accuracy counted from the detection reaches
+    ≥ 95% of the before accuracy. It's only checked after 50 instances.
 - **Live runs:** runs are live. No error cache is possible because DDD's errors depend on its
   own alarms.
 - **Choices beyond the user's spec:**

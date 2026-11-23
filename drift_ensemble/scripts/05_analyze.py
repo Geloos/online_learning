@@ -1,5 +1,7 @@
 """Build every analysis table and plot from the finished run folders
-(never reruns experiments)."""
+(never reruns experiments), then the detection statistics of every method
+(precision, recall, F1, delay: medians, delay curves, bar charts per
+mode) under statistics/drift_ensemble/."""
 
 import argparse
 import sys
@@ -15,14 +17,28 @@ def main() -> None:
     ap.add_argument("--no-plots", action="store_true")
     args = ap.parse_args()
 
+    import pandas as pd
+
     from drift_ensemble import config
     from drift_ensemble.analysis import analyze
+    from drift_ensemble.stats import run_statistics
 
     print(f"Analyzing runs under {config.TEST_DIR} ...")
     analyze(make_plots=not args.no_plots)
     print(f"\nTables: {config.ANALYSIS_DIR / 'tables'}")
     if not args.no_plots:
         print(f"Plots:  {config.ANALYSIS_DIR / 'plots'}")
+
+    summary = run_statistics()
+    if summary.empty:
+        return
+    with pd.option_context("display.width", 200,
+                           "display.max_columns", 20,
+                           "display.float_format", "{:.3f}".format):
+        print(f"\nMedians per method x mode (max delay {config.MAX_DELAY}; "
+              f"delay = median over detected drifts)")
+        print(summary.to_string(index=False))
+    print(f"\nStatistics written to {config.STATISTICS_DIR}")
 
 
 if __name__ == "__main__":

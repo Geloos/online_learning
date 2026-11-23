@@ -53,8 +53,10 @@ def main() -> None:
             "mean_precision", "mean_mean_delay", "mean_far"]
     print(with_cluster[cols].to_string(index=False,
                                        float_format=lambda v: f"{v:.3f}"))
-    print("\nCheck: each detector should score best on its own cluster's "
-          "mode (CLUSTER_MEMBERS in config.py).")
+    print("\nCheck CLUSTER_MEMBERS in config.py: a detector runs with its "
+          "cluster's params on every stream, so it belongs to the cluster "
+          "whose params hurt it least on the other stream type (see the "
+          "comment there and statistics/drift_ensemble/screening.csv).")
 
 
 if __name__ == "__main__":

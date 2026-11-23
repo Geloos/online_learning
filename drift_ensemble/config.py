@@ -24,6 +24,9 @@ CACHE_DIR = RESULTS_DIR / "cache"
 TUNING_DIR = RESULTS_DIR / "tuning"
 TEST_DIR = RESULTS_DIR / "test"
 ANALYSIS_DIR = RESULTS_DIR / "analysis"
+# Statistics (statistics.py-style medians, delay curves, histograms) live
+# outside results/, which holds only run outcomes.
+STATISTICS_DIR = PROJECT_ROOT / "statistics" / "drift_ensemble"
 
 # ---------------------------------------------------------------------------
 # Streams (built by the shared streams.py)
@@ -32,15 +35,22 @@ GENERATORS = ["Agrawal", "SEA", "STAGGER"]
 N_DRIFTS = 30  # MIXED streams: half abrupt, half gradual (15 / 15)
 DRIFT_EVERY_N = 10_000
 GRADUAL_WIDTH = 2_000
+RECURRING_N_CONCEPTS = 3  # concepts cycled by a RECURRING stream
 STREAM_SIZES = {
     "n_drifts": N_DRIFTS,
     "drift_every_n": DRIFT_EVERY_N,
     "gradual_width": GRADUAL_WIDTH,
+    # Used by RECURRING only; plan_stream ignores it for the other modes, so
+    # adding it left every earlier plan and cached stream unchanged.
+    "n_concepts": RECURRING_N_CONCEPTS,
 }
 # All 3 generators (15 MIXED test streams, was Agrawal only = 5): with 5
 # pairs Wilcoxon cannot reach p < 0.0625, so MIXED could never be significant.
 MIXED_GENERATORS = ["Agrawal", "SEA", "STAGGER"]
-MODES = ["ABRUPT", "GRADUAL", "MIXED"]
+# RECURRING (added 2026-11-20): like MIXED, but cycling through
+# RECURRING_N_CONCEPTS concepts. Test-only, like MIXED.
+RECURRING_GENERATORS = ["Agrawal", "SEA", "STAGGER"]
+MODES = ["ABRUPT", "GRADUAL", "MIXED", "RECURRING"]
 PURE_MODES = ("ABRUPT", "GRADUAL")  # tuning uses the pure modes only
 
 # ---------------------------------------------------------------------------
@@ -60,7 +70,9 @@ def test_stream_specs() -> list[tuple[str, str, int]]:
     pure = [(g, mode, s) for g in GENERATORS for mode in PURE_MODES
             for s in TEST_SEEDS]
     mixed = [(g, "MIXED", s) for g in MIXED_GENERATORS for s in TEST_SEEDS]
-    return pure + mixed
+    recurring = [(g, "RECURRING", s) for g in RECURRING_GENERATORS
+                 for s in TEST_SEEDS]
+    return pure + mixed + recurring
 
 # ---------------------------------------------------------------------------
 # Learner / detection
@@ -69,6 +81,11 @@ MIN_TRAINING_SIZE = 1000  # detectors (and HT error logging) start after this
 MAX_DELAY = 500
 DELAY_GRID = list(range(50, 501, 50))  # [50, 100, ..., 500]
 DUPLICATES_AS_FP = True  # extra alarms inside an already-matched window = FP
+
+# Statistics (drift_ensemble/stats.py -> STATISTICS_DIR): medians per
+# method x mode, and the delay curves rescore every run for each max delay
+# in delay_grid (0 = alarm must fall inside the drift itself).
+STATS = {"delay_grid": list(range(0, 501, 25))}
 
 # ---------------------------------------------------------------------------
 # Tuning
@@ -102,24 +119,69 @@ TUNING_GRIDS = {
     },
 }
 
+# capymoa 0.9.0's constructor defaults for the tuned parameters (grid names).
+# Every grid (tuning and screening) also evaluates this config
+# (detectors.iter_configs appends it when the grid misses it: SEED if not
+# sampled, RDDM always), so "the recommended settings" are scored too.
+DEFAULT_PARAMS = {
+    "STEPD": {"window_size": 30, "alpha_drift": 0.003},
+    "SEED": {"delta": 0.05, "epsilon_prime": 0.01, "block_size": 32,
+             "alpha": 0.8},
+    "HDDMWeighted": {"drift_confidence": 0.001, "lambda_": 0.05,
+                     "test_type": "Two-sided"},
+    "RDDM": {"min_n_instances": 129, "drift_level": 2.258},
+    "DDM": {"min_n_instances": 30, "out_control_level": 3.0},
+    "HDDMAverage": {"drift_confidence": 0.001, "test_type": "Two-sided"},
+    "ADWIN": {"delta": 0.002},
+}
+
+# ---------------------------------------------------------------------------
+# Detector screening (drift_ensemble/scripts/screen_detectors.py): extra
+# capymoa detectors tuned and tested as singles on the CACHED errors only, to
+# see whether one beats the study's 4 on ABRUPT / GRADUAL F1. They are NOT
+# in the roster, the clusters or the ensembles. These grids are our own
+# ranges around capymoa's defaults (not from Cerqueira et al.). Only the
+# drift threshold matters here: warning levels are left at their defaults.
+# ---------------------------------------------------------------------------
+SCREENING_DIR = RESULTS_DIR / "screening"
+SCREENING_GRIDS = {
+    "DDM": {  # 49 combos
+        "min_n_instances": [30, 50, 100, 300, 500, 1000, 2000],
+        "out_control_level": [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0],
+    },
+    "HDDMAverage": {  # 16 combos
+        "drift_confidence": [0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01,
+                             0.05, 0.1],
+        "test_type": ["One-sided", "Two-sided"],
+    },
+    "ADWIN": {  # 10 combos
+        "delta": [1e-6, 1e-5, 1e-4, 5e-4, 0.001, 0.002, 0.005, 0.01, 0.05,
+                  0.1],
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Clusters (membership justified by tuning/tuning_summary.csv)
 # Abrupt-cluster detectors run with their ABRUPT-tuned params, gradual-cluster
 # detectors with their GRADUAL-tuned params (see selected_params.json).
 #
-# Assignment chosen from the tuning results (each detector goes to the mode
-# where its tuned config reached the higher mean F1 over the 9 tuning
-# streams of that mode; tuning_summary.csv, 2026-11-12):
-#   STEPD        F1 0.427 ABRUPT vs 0.474 GRADUAL -> GRADUAL
-#   SEED         F1 0.425 ABRUPT vs 0.417 GRADUAL -> ABRUPT
-#   HDDMWeighted F1 0.571 ABRUPT vs 0.691 GRADUAL -> GRADUAL
-#   RDDM         F1 0.580 ABRUPT vs 0.533 GRADUAL -> ABRUPT
-# (The spec's provisional {ABRUPT: STEPD+SEED, GRADUAL: HDDM+RDDM} was only
-# half-supported by the data; user picked the evidence-based split.)
+# Assignment (2026-11-20, tuning with MAX_DELAY = 500): a detector always
+# runs with its cluster's params, so it goes to the cluster whose params hurt
+# it least on the other stream type. Median test F1 (ABRUPT / GRADUAL
+# streams) with the ABRUPT-tuned vs the GRADUAL-tuned params
+# (statistics/drift_ensemble/screening.csv, results/.../screening/):
+#   HDDMWeighted 0.596 / 0.536  vs  0.074 / 0.553  -> ABRUPT
+#   STEPD        0.345 / 0.383  vs  0.178 / 0.516  -> GRADUAL
+#   SEED         0.317 / 0.441  vs  0.328 / 0.438  -> GRADUAL (no difference)
+#   RDDM         same params for both modes        -> ABRUPT (2nd-best
+#                detector on ABRUPT, tuning F1 0.476)
+# The earlier rule ("the mode with the higher tuning F1") no longer works:
+# with the 500 window every detector scores higher on GRADUAL (a gradual
+# drift's window is GRADUAL_WIDTH + MAX_DELAY wide).
 # ---------------------------------------------------------------------------
 CLUSTER_MEMBERS = {
-    "ABRUPT": ["SEED", "RDDM"],
-    "GRADUAL": ["STEPD", "HDDMWeighted"],
+    "ABRUPT": ["HDDMWeighted", "RDDM"],
+    "GRADUAL": ["STEPD", "SEED"],
 }
 # Fixed tie-break order for choosing the trigger when several detectors fire
 # on the same instance.
@@ -179,17 +241,24 @@ DETECTOR_SELF_RESETS = {
     "SEED": True,
     "HDDMWeighted": True,
     "RDDM": True,
+    # Screening detectors (probe 2026-11-20: 10% -> 60% error twice; each
+    # fired again on the second rise without reset(). ADWIN fires a few
+    # times per drift as its window shrinks.)
+    "DDM": True,
+    "HDDMAverage": True,
+    "ADWIN": True,
 }
 
 # ---------------------------------------------------------------------------
-# Test-run methods
+# Test-run methods. ens_raw (OR, each detector only self-resets) was dropped
+# on 2026-11-23: DDD (experiment 2) can't use it, so both experiments share
+# the same 7 methods.
 # ---------------------------------------------------------------------------
 METHODS = [
     "single_STEPD",
     "single_SEED",
     "single_HDDMWeighted",
     "single_RDDM",
-    "ens_raw",
     "ens_raw_resetall",
     "ens_cluster_vote",
     "ens_cluster_sens",
@@ -203,6 +272,7 @@ def snapshot() -> dict:
         "N_DRIFTS": N_DRIFTS,
         "DRIFT_EVERY_N": DRIFT_EVERY_N,
         "GRADUAL_WIDTH": GRADUAL_WIDTH,
+        "RECURRING_N_CONCEPTS": RECURRING_N_CONCEPTS,
         "INIT_FUNCTION": streams.INIT_FUNCTION,
         "MIN_TRAINING_SIZE": MIN_TRAINING_SIZE,
         "MAX_DELAY": MAX_DELAY,

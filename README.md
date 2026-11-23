@@ -82,22 +82,27 @@ classification function. The seed fixes the whole stream.
   1. Cache the 18 tuning streams.
   2. Tune each detector's grid on them, and pick the best config separately for ABRUPT and
      for GRADUAL.
-  3. Split the detectors into two clusters by where they scored better: ABRUPT = SEED + RDDM,
-     GRADUAL = STEPD + HDDMWeighted.
-  4. Run 8 methods on 45 test streams.
+  3. Split the detectors into two clusters: ABRUPT = HDDMWeighted + RDDM,
+     GRADUAL = STEPD + SEED. Each detector goes where its cluster's params hurt it least on
+     the other stream type.
+  4. Run 7 methods on 60 test streams: 3 generators × 4 modes × 5 seeds. RECURRING uses the
+     same tuned params as MIXED.
   5. Score them.
 - **Methods:**
 
 | Method | Alarm rule |
 |---|---|
 | `single_*` (×4) | the detector fires |
-| `ens_raw` | any detector fires (each self-resets) |
 | `ens_raw_resetall` | any detector fires; all 4 reset |
 | `ens_cluster_vote` | both detectors of a cluster fire within 250 instances (or one full-weight detector); the faster voter gains weight |
 | `ens_cluster_sens` | same pair rule; the slower voter is made more sensitive (its threshold is changed mid-stream) |
 
 - **Scoring:** an alarm is a true positive if it falls in `[drift start, drift end + 500]`.
   The metrics are precision, recall, F1, delay and false-alarm rate, with Wilcoxon tests on F1.
+  `statistics/drift_ensemble/` holds, for every method × mode:
+  - medians of precision, recall, F1 and delay;
+  - curves of how they change as the allowed delay shrinks from 500 to 0;
+  - histograms of each metric.
 
 **Experiment 2: extended DDD.**
 - **Streams:** 3 generators × 4 modes × 10 seeds, with 8 drifts per stream, one every 5,000
@@ -134,6 +139,9 @@ drift_ensemble/        experiment 1
   workflow.py, runio.py     one method on one test stream, result folders
   evaluation.py        alarm <-> drift matching and metrics
   analysis.py          tables and plots (reads result folders only)
+  stats.py             per-method statistics -> statistics/drift_ensemble/
+  screening.py         DDM / HDDMAverage / ADWIN screened against the 4 (singles,
+                       cached errors; scripts/screen_detectors.py)
   cli.py               shared CLI helpers (time estimate, workers)
   scripts/             01-05 pipeline steps
   tests/
@@ -144,12 +152,16 @@ ensemble_experiment/   experiment 2
   tracker.py, cap.py, pool.py   accuracy trackers, adaptive cap, concept pool
   detection.py         experiment 1's methods as DDD drift signals
   logger.py, runner.py      one run -> result folder
-  analysis.py          tables and plots (reads result folders only)
+  analysis.py          best-method statistics (reads result folders only)
   run_experiment.py, analyze.py   CLIs
   tests/
 results/
   results_drift_ensemble/   cache/  tuning/  test/  analysis/{tables,plots}
-  results_ensemble/         runs/<generator>,<mode>,<seed>,<method>/  analysis/
+  results_ensemble/         runs/<generator>,<mode>,<seed>,<method>/
+statistics/
+  drift_ensemble/           runs.csv  delays.csv  metrics.csv  delay_curve.csv
+                            <MODE>/{singles,ensembles,delay_curve}.png
+  ensemble_experiment/      recovery.csv  drifts.csv  accuracy_200_<MODE>.png
 ```
 
 Only `results/results_drift_ensemble/tuning/` is in git. It holds the tuned detector

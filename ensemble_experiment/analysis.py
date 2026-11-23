@@ -1,20 +1,38 @@
-"""Tables and plots of the extended-DDD experiment.
+"""Statistics of the extended-DDD experiment for one method (config.STATS,
+the method with the best DDD accuracy).
 
 Reads ONLY the run folders under results/results_ensemble/runs/ (never
-re-runs streams) and writes to results/results_ensemble/analysis/:
-  runs.csv                          one row per run (meta.json summaries)
-  summary_by_mode_method.csv        means over generators x seeds
-  summary_by_generator_mode_method.csv
-  episodes_all.csv                  every episode of every run
-  acc_curves_<MODE>.png             windowed accuracy, one stream per mode
-  caps_<MODE>.png                   cap_fast / cap_slow over that stream
-  exit_types.png                    exit-type shares per method and mode
-  acc_vs_f1.png                     DDD accuracy vs detection F1
+re-runs streams) and writes to statistics/ensemble_experiment/:
+
+  recovery.csv              one row per mode (ABRUPT, GRADUAL, MIXED, RECURRING)
+  drifts.csv                one row per run x real drift of the method
+  accuracy_200_<MODE>.png   median moving accuracy over the method's runs
+
+Recovery uses only real drifts and the alarm that detected each one (its
+TP episode); false alarms never count. Per detected drift:
+  acc_before           accuracy over the stable period before the drift:
+                       from the previous drift's end (the first drift: from
+                       the end of the warm-up) up to the drift start
+  acc_drift_to_detect  accuracy from the drift start up to its detection
+  rec_instances        instances after the detection until the accuracy
+                       counted from the detection (all instances since it)
+                       first reaches RECOVERY["level"] x acc_before; checked
+                       only once RECOVERY["min_instances"] instances have
+                       passed. NaN = not before the next drift.
+
+Plots: one dot per block of STATS["acc_block"] instances = the median over
+the method's runs of that block's accuracy. When every run of a mode has its
+drifts at the same positions (ABRUPT, GRADUAL) the x-axis is the whole
+stream; otherwise (MIXED, RECURRING: the order of abrupt and gradual drifts
+differs per seed) the blocks are aligned on each drift start, from
+STATS["pre"] before to STATS["post"] after, with the median over drifts and
+one line for abrupt and one for gradual drifts.
 """
 
 from __future__ import annotations
 
 import json
+import warnings
 
 import matplotlib
 
@@ -24,23 +42,18 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from ensemble_experiment import config  # noqa: E402
-from ensemble_experiment.logger import EXIT_TYPES  # noqa: E402
 
 KEYS = ["generator", "mode", "seed", "method"]
-MEAN_COLS = ["acc", "f1", "precision", "recall", "mean_delay", "far",
-             "n_detections", "frac_after", "frac_5", "mean_steps_after",
-             "kind_acc", "recall_hit_rate", "recall_hit_rate_older"]
-SUM_COLS = (["tp", "fp", "fn", "n_recalls", "n_recalls_older",
-             "n_kind_graded"] + [f"exit_{e}" for e in EXIT_TYPES])
-ACC_WINDOW = 500  # moving-average window for accuracy curves
 
 
-def load_runs(runs_dir=None) -> tuple[pd.DataFrame, pd.DataFrame, list]:
-    """(runs, episodes, metas) of every complete run of a roster method."""
+def load_runs(runs_dir=None, method: str | None = None
+              ) -> tuple[pd.DataFrame, list]:
+    """(episodes, metas) of every complete run of ``method`` (default: every
+    roster method); metas = [(run folder, meta dict)]."""
     runs_dir = config.RUNS_DIR if runs_dir is None else runs_dir
-    rows, eps, metas = [], [], []
+    eps, metas = [], []
     if not runs_dir.exists():
-        return pd.DataFrame(), pd.DataFrame(), []
+        return pd.DataFrame(), []
     for d in sorted(runs_dir.iterdir()):
         meta_path = d / "meta.json"
         if not meta_path.exists():
@@ -48,176 +61,227 @@ def load_runs(runs_dir=None) -> tuple[pd.DataFrame, pd.DataFrame, list]:
         meta = json.loads(meta_path.read_text())
         if meta["method"] not in config.METHODS:
             continue  # stale method
-        key = {k: meta[k] for k in KEYS}
-        rows.append({**key, **meta["summary"],
-                     "runtime_s": meta["runtime_s"]})
+        if method is not None and meta["method"] != method:
+            continue
         ep = pd.read_csv(d / "episodes.csv")
         if len(ep):
-            for k, v in key.items():
-                ep.insert(0, k, v)
+            for k in KEYS:
+                ep.insert(0, k, meta[k])
             eps.append(ep)
         metas.append((d, meta))
-    runs = pd.DataFrame(rows)
     episodes = pd.concat(eps, ignore_index=True) if eps else pd.DataFrame()
-    return runs, episodes, metas
-
-
-def _order(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["mode"] = pd.Categorical(df["mode"], config.MODES, ordered=True)
-    df["method"] = pd.Categorical(df["method"], config.METHODS, ordered=True)
-    return df
-
-
-def summarize(runs: pd.DataFrame, by: list[str]) -> pd.DataFrame:
-    runs = _order(runs)
-    g = runs.groupby(by, observed=True)
-    out = g[MEAN_COLS].mean()
-    out["acc_std"] = g["acc"].std()
-    out["f1_std"] = g["f1"].std()
-    out = out.join(g[SUM_COLS].sum())
-    out["n_runs"] = g.size()
-    return out.reset_index()
+    return episodes, metas
 
 
 # ---------------------------------------------------------------------------
-# Plots
+# Recovery after real drifts
 # ---------------------------------------------------------------------------
-def _representative(metas, mode):
-    """(generator, seed) of the first stream of ``mode`` with the most
-    finished methods."""
-    counts: dict[tuple, int] = {}
-    for _, m in metas:
-        if m["mode"] == mode:
-            k = (m["generator"], m["seed"])
-            counts[k] = counts.get(k, 0) + 1
-    if not counts:
-        return None
-    best = max(counts.values())
-    return min(k for k, c in counts.items() if c == best)
+def drift_bounds(ground_truth, length: int) -> list[tuple[int, int, int]]:
+    """(start, end, next drift start) of every real drift, in time order;
+    the last drift's "next start" is the stream length."""
+    truth = sorted(ground_truth, key=lambda d: d["start"])
+    nxt = [d["start"] for d in truth[1:]] + [length]
+    return [(d["start"], d["end"], n) for d, n in zip(truth, nxt)]
 
 
-def _drift_marks(ax, ground_truth):
-    for d in ground_truth:
-        if d["end"] > d["start"]:
-            ax.axvspan(d["start"], d["end"], color="0.85", lw=0)
-        else:
-            ax.axvline(d["start"], color="0.6", lw=0.8, ls="--")
+def recovery_instances(correct, t_detect: int, stop: int, target: float,
+                       min_instances: int) -> int | None:
+    """Instances after ``t_detect`` until the accuracy counted from the
+    detection (instances t_detect+1 .. t, all of them) first reaches
+    ``target``, checked only once ``min_instances`` instances have passed;
+    None if that does not happen before ``stop`` (the next drift)."""
+    c = np.asarray(correct[t_detect + 1:stop], dtype=float)
+    n = np.arange(1, len(c) + 1)
+    acc = np.cumsum(c) / n
+    hit = np.flatnonzero((acc >= target - 1e-12) & (n >= min_instances))
+    return int(n[hit[0]]) if len(hit) else None
 
 
-def plot_acc_curves(metas, out_dir) -> None:
-    for mode in config.MODES:
-        rep = _representative(metas, mode)
-        if rep is None:
-            continue
-        gen, seed = rep
-        sel = [(d, m) for d, m in metas
-               if (m["generator"], m["mode"], m["seed"]) == (gen, mode, seed)]
-        fig, ax = plt.subplots(figsize=(11, 4))
-        _drift_marks(ax, sel[0][1]["ground_truth"])
-        kernel = np.ones(ACC_WINDOW) / ACC_WINDOW
-        for d, m in sorted(sel, key=lambda x: config.METHODS.index(
-                x[1]["method"])):
-            c = np.load(d / "correct.npy").astype(float)
-            ma = np.convolve(c, kernel, mode="valid")
-            ax.plot(np.arange(ACC_WINDOW - 1, len(c)), ma, lw=0.9,
-                    label=f"{m['method']} ({m['summary']['acc']:.3f})")
-        ax.set(title=f"DDD accuracy, {gen} {mode} seed {seed} "
-                     f"(window {ACC_WINDOW}; grey = drifts)",
-               xlabel="instance", ylabel="accuracy")
-        ax.legend(fontsize=7, ncol=2, loc="lower left")
-        fig.tight_layout()
-        fig.savefig(out_dir / f"acc_curves_{mode}.png", dpi=130)
-        plt.close(fig)
+def drift_table(metas, episodes: pd.DataFrame, rec: dict | None = None,
+                warmup: int | None = None) -> pd.DataFrame:
+    """One row per (run, real drift) of the given runs.
 
-
-def plot_caps(metas, out_dir) -> None:
-    for mode in config.MODES:
-        rep = _representative(metas, mode)
-        if rep is None:
-            continue
-        gen, seed = rep
-        sel = [(d, m) for d, m in metas
-               if (m["generator"], m["mode"], m["seed"]) == (gen, mode, seed)]
-        fig, axes = plt.subplots(1, 2, figsize=(11, 3.5), sharey=True)
-        for d, m in sorted(sel, key=lambda x: config.METHODS.index(
-                x[1]["method"])):
-            st = pd.read_csv(d / "steps.csv")
-            for ax, col in zip(axes, ["cap_fast", "cap_slow"]):
-                ax.step(st["t"], st[col], where="post", lw=0.9,
-                        label=m["method"])
-        for ax, col in zip(axes, ["cap_fast", "cap_slow"]):
-            _drift_marks(ax, sel[0][1]["ground_truth"])
-            ax.set(title=f"{col}, {gen} {mode} seed {seed}",
-                   xlabel="instance")
-        axes[0].set_ylabel("cap (instances)")
-        axes[1].legend(fontsize=7)
-        fig.tight_layout()
-        fig.savefig(out_dir / f"caps_{mode}.png", dpi=130)
-        plt.close(fig)
-
-
-def plot_exit_types(summary: pd.DataFrame, out_dir) -> None:
-    cols = [f"exit_{e}" for e in EXIT_TYPES]
-    modes = [m for m in config.MODES if m in set(summary["mode"].astype(str))]
-    if not modes:
-        return
-    fig, axes = plt.subplots(1, len(modes), figsize=(4 * len(modes), 4),
-                             sharey=True, squeeze=False)
-    for ax, mode in zip(axes[0], modes):
-        s = summary[summary["mode"].astype(str) == mode].set_index("method")
-        shares = s[cols].div(s[cols].sum(axis=1).replace(0, np.nan), axis=0)
-        bottom = np.zeros(len(shares))
-        for col in cols:
-            ax.bar(range(len(shares)), shares[col].fillna(0), bottom=bottom,
-                   label=col[len("exit_"):])
-            bottom += shares[col].fillna(0).to_numpy()
-        ax.set_xticks(range(len(shares)))
-        ax.set_xticklabels([str(i) for i in shares.index], rotation=60,
-                           ha="right", fontsize=7)
-        ax.set_title(mode)
-    axes[0][0].set_ylabel("share of episodes")
-    axes[0][-1].legend(fontsize=7)
-    fig.tight_layout()
-    fig.savefig(out_dir / "exit_types.png", dpi=130)
-    plt.close(fig)
-
-
-def plot_acc_vs_f1(summary: pd.DataFrame, out_dir) -> None:
-    fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    for mode in config.MODES:
-        s = summary[summary["mode"].astype(str) == mode]
-        if s.empty:
-            continue
-        ax.scatter(s["f1"], s["acc"], label=mode, s=25)
-        for _, r in s.iterrows():
-            ax.annotate(str(r["method"]).replace("single_", ""),
-                        (r["f1"], r["acc"]), fontsize=6,
-                        xytext=(3, 2), textcoords="offset points")
-    ax.set(xlabel="detection F1 (mean)", ylabel="DDD accuracy (mean)",
-           title="Does better detection give a better DDD?")
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(out_dir / "acc_vs_f1.png", dpi=130)
-    plt.close(fig)
-
-
-def run_analysis(runs_dir=None, out_dir=None) -> pd.DataFrame:
-    out_dir = config.ANALYSIS_DIR if out_dir is None else out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    runs, episodes, metas = load_runs(runs_dir)
-    if runs.empty:
-        print("No finished runs found.")
-        return runs
-    runs.sort_values(KEYS).to_csv(out_dir / "runs.csv", index=False)
+    A drift counts as detected when the run has a TP episode matched to it
+    (logger.label_alarms); its t_detect is that alarm."""
+    rec = config.RECOVERY if rec is None else rec
+    warmup = config.MIN_TRAINING_SIZE if warmup is None else warmup
+    tp = {}
     if not episodes.empty:
-        episodes.to_csv(out_dir / "episodes_all.csv", index=False)
-    by_mode = summarize(runs, ["mode", "method"])
-    by_mode.to_csv(out_dir / "summary_by_mode_method.csv", index=False)
-    summarize(runs, ["generator", "mode", "method"]).to_csv(
-        out_dir / "summary_by_generator_mode_method.csv", index=False)
-    plot_acc_curves(metas, out_dir)
-    plot_caps(metas, out_dir)
-    plot_exit_types(by_mode, out_dir)
-    plot_acc_vs_f1(by_mode, out_dir)
-    return by_mode
+        e = episodes[episodes["label"] == "TP"]
+        for r in e[KEYS + ["drift_idx", "t_detect"]].itertuples(index=False):
+            tp[(r.generator, r.mode, r.seed, r.method,
+                int(r.drift_idx))] = int(r.t_detect)
+    rows = []
+    for d, m in metas:
+        c = np.load(d / "correct.npy").astype(float)
+        key = tuple(m[k] for k in KEYS)
+        truth = sorted(m["ground_truth"], key=lambda g: g["start"])
+        prev_end = warmup
+        for k, (g, (s, e, nxt)) in enumerate(
+                zip(truth, drift_bounds(truth, len(c)))):
+            td = tp.get((*key, k))
+            before = float(c[prev_end:s].mean())
+            n = (None if td is None else recovery_instances(
+                c, td, nxt, rec["level"] * before, rec["min_instances"]))
+            rows.append({
+                **dict(zip(KEYS, key)), "drift": k, "type": g["type"],
+                "recurring": g.get("recurring"), "start": s, "end": e,
+                "next_start": nxt, "detected": td is not None,
+                "t_detect": td, "delay": None if td is None else td - s,
+                "acc_before": before,
+                "acc_drift_to_detect": (np.nan if td is None
+                                        else float(c[s:td + 1].mean())),
+                "rec_instances": np.nan if n is None else n,
+                "recovered": None if td is None else n is not None,
+            })
+            prev_end = e
+    return pd.DataFrame(rows)
+
+
+def mode_summary(drifts: pd.DataFrame) -> pd.DataFrame:
+    """One row per mode (config.MODES order) of one method's drift rows:
+    medians over its detected real drifts."""
+    rows = []
+    for mode in config.MODES:
+        x = drifts[drifts["mode"] == mode]
+        if x.empty:
+            continue
+        det = x[x["detected"]]
+        rec = det["rec_instances"]
+        rows.append({
+            "mode": mode,
+            "drifts": len(x),
+            "detected": len(det),
+            "acc_before_median": det["acc_before"].median(),
+            "acc_drift_to_detect_median": det["acc_drift_to_detect"].median(),
+            "rec_instances_median": rec.median(),
+            "recovered_pct": (100 * rec.notna().mean() if len(det)
+                              else np.nan),
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Median accuracy per block of instances (one plot point per block)
+# ---------------------------------------------------------------------------
+def block_acc(correct, block: int) -> np.ndarray:
+    """Accuracy of each consecutive, non-overlapping ``block`` of instances
+    (a last partial block is dropped)."""
+    c = np.asarray(correct, dtype=float)
+    n = len(c) // block
+    return c[:n * block].reshape(n, block).mean(axis=1)
+
+
+def _nanmedian(stack: np.ndarray) -> np.ndarray:
+    """Column median ignoring NaN, without all-NaN warnings."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmedian(stack, axis=0)
+
+
+def median_blocks_stream(arrays, block: int) -> np.ndarray:
+    """Median over runs of every block's accuracy (runs are cut to the
+    shortest one). Block k covers instances [k*block, (k+1)*block)."""
+    n = min(len(a) for a in arrays)
+    return _nanmedian(np.stack([block_acc(a[:n], block) for a in arrays]))
+
+
+def median_blocks_aligned(runs, block: int, pre: int, post: int
+                          ) -> tuple[np.ndarray, int]:
+    """Median over drifts of the block accuracies from ``pre`` before to
+    ``post`` after each drift start (blocks start at the drift start, so
+    block k covers [start - pre + k*block, ... + block)).
+    ``runs`` = [(correct, [drift starts])]. Returns (curve of
+    (pre + post) // block values, number of drifts used)."""
+    segs = []
+    for correct, starts in runs:
+        for s in starts:
+            if s - pre >= 0 and s + post <= len(correct):
+                segs.append(block_acc(correct[s - pre:s + post], block))
+    if not segs:
+        return np.full((pre + post) // block, np.nan), 0
+    return _nanmedian(np.stack(segs)), len(segs)
+
+
+def _same_positions(metas) -> bool:
+    pos = {tuple((d["start"], d["end"]) for d in m["ground_truth"])
+           for _, m in metas}
+    return len(pos) == 1
+
+
+_DOTS = dict(marker="o", ms=3, lw=1.0)
+
+
+def plot_accuracy_200(metas, arrays, mode: str, method: str, out_dir,
+                      stats: dict | None = None) -> None:
+    """accuracy_<block>_<mode>.png for ``method`` (``metas`` = its runs of
+    ``mode``): one dot per block of STATS["acc_block"] instances."""
+    stats = config.STATS if stats is None else stats
+    b = stats["acc_block"]
+    if not metas:
+        return
+    fig, ax = plt.subplots(figsize=(11, 4))
+    if _same_positions(metas):
+        curve = median_blocks_stream([arrays[d.name] for d, _ in metas], b)
+        for g in metas[0][1]["ground_truth"]:
+            if g["end"] > g["start"]:
+                ax.axvspan(g["start"], g["end"], color="0.85", lw=0)
+            else:
+                ax.axvline(g["start"], color="0.5", lw=0.8, ls="--")
+        ax.plot(np.arange(len(curve)) * b + b / 2, curve, **_DOTS)
+        ax.set(xlabel="instance (dashed = abrupt drift, grey = gradual "
+                      "transition)",
+               title=f"{method}, {mode}: median accuracy per {b} instances "
+                     f"over {len(metas)} runs")
+    else:
+        # Abrupt and gradual drifts recover differently: one line each.
+        pre, post = stats["pre"], stats["post"]
+        x = np.arange(-pre, post, b) + b / 2
+        widths = {g["end"] - g["start"] for _, m in metas
+                  for g in m["ground_truth"]} - {0}
+        if widths:
+            ax.axvspan(0, max(widths), color="0.9", lw=0,
+                       label="gradual transition")
+        ax.axvline(0, color="0.5", lw=0.8, ls="--", label="drift start")
+        for typ in ["ABRUPT", "GRADUAL"]:
+            curve, n = median_blocks_aligned(
+                [(arrays[d.name], [g["start"] for g in m["ground_truth"]
+                                   if g["type"] == typ])
+                 for d, m in metas], b, pre, post)
+            if n:
+                ax.plot(x, curve, label=f"{typ.lower()} drifts (n={n})",
+                        **_DOTS)
+        ax.legend(fontsize=8, loc="lower right")
+        ax.set(xlabel="instances since drift start",
+               title=f"{method}, {mode}: median accuracy per {b} instances, "
+                     f"aligned on each drift ({len(metas)} runs)")
+    ax.set_ylabel("accuracy")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_dir / f"accuracy_{b}_{mode}.png", dpi=130)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+def run_analysis(runs_dir=None, out_dir=None, method: str | None = None
+                 ) -> pd.DataFrame:
+    """Write recovery.csv, drifts.csv and the plots for ``method``
+    (default config.STATS["method"]); returns the recovery table."""
+    out_dir = config.ANALYSIS_DIR if out_dir is None else out_dir
+    method = config.STATS["method"] if method is None else method
+    episodes, metas = load_runs(runs_dir, method)
+    if not metas:
+        print(f"No finished runs of {method} found.")
+        return pd.DataFrame()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    drifts = drift_table(metas, episodes)
+    drifts.to_csv(out_dir / "drifts.csv", index=False)
+    summary = mode_summary(drifts)
+    summary.to_csv(out_dir / "recovery.csv", index=False)
+
+    arrays = {d.name: np.load(d / "correct.npy") for d, _ in metas}
+    for mode in config.MODES:
+        sel = [(d, m) for d, m in metas if m["mode"] == mode]
+        plot_accuracy_200(sel, arrays, mode, method, out_dir)
+    return summary

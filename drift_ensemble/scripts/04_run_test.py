@@ -1,4 +1,4 @@
-"""Cache HT errors for the 45 test streams, then run every method on every
+"""Cache HT errors for the 60 test streams, then run every method on every
 test stream (resumable; one JVM per worker)."""
 
 import argparse

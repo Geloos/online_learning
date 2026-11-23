@@ -55,11 +55,14 @@ def plots_dir():
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
-def load_runs() -> list[dict]:
+def load_runs(test_dir=None) -> list[dict]:
+    """Every finished run of a roster method under ``test_dir`` (default
+    config.TEST_DIR): dicts with dir, meta and alarms."""
+    test_dir = config.TEST_DIR if test_dir is None else test_dir
     runs = []
-    if not config.TEST_DIR.exists():
+    if not test_dir.exists():
         return runs
-    for meta_path in sorted(config.TEST_DIR.glob("*/meta.json")):
+    for meta_path in sorted(test_dir.glob("*/meta.json")):
         meta = json.loads(meta_path.read_text())
         if meta["method"] not in config.METHODS:
             continue  # stale folder of a method dropped from the roster
@@ -134,7 +137,8 @@ def per_run_metrics(runs) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-MODE_ORDER = ["ABRUPT", "GRADUAL", "MIXED", "ALL"]
+MODE_ORDER = ["ABRUPT", "GRADUAL", "MIXED", "RECURRING", "ALL"]
+MIXED_MODES = ("MIXED", "RECURRING")  # abrupt and gradual drifts together
 
 
 def detection_metrics(metrics: pd.DataFrame
@@ -206,9 +210,11 @@ def delay_curve_table(runs) -> pd.DataFrame:
 
 
 def per_type_mixed(runs) -> pd.DataFrame:
+    """Recall and mean delay per drift type on the streams that mix abrupt
+    and gradual drifts (MIXED, RECURRING)."""
     rows = []
     for r in runs:
-        if r["meta"]["mode"] != "MIXED":
+        if r["meta"]["mode"] not in MIXED_MODES:
             continue
         e = _eval_cfg(r)
         pt = per_type(r["alarms"], r["meta"]["ground_truth"],
@@ -216,6 +222,7 @@ def per_type_mixed(runs) -> pd.DataFrame:
         for dtype, vals in pt.items():
             rows.append({
                 "method": r["meta"]["method"],
+                "mode": r["meta"]["mode"],
                 "generator": r["meta"]["generator"],
                 "seed": r["meta"]["seed"],
                 "drift_type": dtype,
@@ -224,11 +231,11 @@ def per_type_mixed(runs) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    out = (df.groupby(["method", "drift_type"], observed=True)
+    out = (df.groupby(["mode", "method", "drift_type"], observed=True)
            .agg(n_runs=("recall", "size"), recall=("recall", "mean"),
                 mean_delay=("mean_delay", "mean")).reset_index())
     out["method"] = _method_cat(out["method"])
-    return out.sort_values(["drift_type", "method"])
+    return out.sort_values(["mode", "drift_type", "method"])
 
 
 def first_to_fire(runs) -> pd.DataFrame:

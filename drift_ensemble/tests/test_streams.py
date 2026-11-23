@@ -85,11 +85,11 @@ def test_stream_sets():
     tuning = _tuning_specs()
     test = _test_specs()
     assert len(tuning) == 18  # 3 generators x 2 modes x 3 seeds
-    assert len(test) == 45  # 3 x 2 x 5 + 3 x MIXED x 5
+    assert len(test) == 60  # 3 x 2 x 5 + 3 x (MIXED, RECURRING) x 5
     tuning_seeds = {s for _, _, s in tuning}
     test_seeds = {s for _, _, s in test}
     assert not tuning_seeds & test_seeds
-    assert len({stream_id(*s) for s in tuning + test}) == 63
+    assert len({stream_id(*s) for s in tuning + test}) == 78
 
 
 # ---------------------------------------------------------------------------
