@@ -18,8 +18,8 @@ RUNS_DIR = RESULTS_DIR / "runs"
 # Statistics computed from the runs (analysis.py) live outside results/.
 ANALYSIS_DIR = base.PROJECT_ROOT / "statistics" / "ensemble_experiment"
 # Detector params tuned by the drift-ensemble experiment. Phase 1
-# (03_select_params.py) for the singles and ens_raw_resetall; phase 2
-# (03b_tune_min_instances.py: the cluster's shared minimum + re-tuned
+# (`python main.py select`) for the singles and ens_raw_resetall; phase 2
+# (`python main.py phase2`: the cluster's shared minimum + re-tuned
 # params) for the two-vote methods (base.PHASE2_METHODS).
 SELECTED_PARAMS_PATH = base.TUNING_DIR / "selected_params.json"
 CLUSTER_PARAMS_PATH = base.CLUSTER_PARAMS_PATH
@@ -110,7 +110,8 @@ STATS = {"method": "ens_raw_resetall", "acc_block": 200,
          "pre": 1000, "post": 5000}
 
 # ---------------------------------------------------------------------------
-# Real datasets (real.py, run_real.py): no known drift positions, so only
+# Real datasets (`python main.py real`; runs.py, analysis.py): no known
+# drift positions, so only
 # prequential accuracy and detection counts are reported. Same DDD config
 # as the synthetic runs; only the best method, ONE run (seed REAL_SEED, the
 # user's choice), plus a no-change baseline. The ARFF files come
@@ -123,6 +124,8 @@ DATA_DIR = base.PROJECT_ROOT / "data"  # downloaded datasets (not in git)
 REAL_RUNS_DIR = RESULTS_DIR / "real"
 REAL_STATS_DIR = ANALYSIS_DIR / "real"
 REAL_METHODS = [STATS["method"]]  # ens_raw_resetall only (user's choice)
+REAL_BASELINES = ["no_change"]  # predicts the previous instance's label
+REAL_RUN_METHODS = REAL_METHODS + REAL_BASELINES  # every run per dataset
 REAL_SEED = SEEDS[0]  # one run per dataset: bagging seed 201
 REAL_DATASETS = {
     "Electricity": {
@@ -158,7 +161,8 @@ REAL_DATASETS = {
     },
 }
 # The large datasets (540k-830k instances) need more JVM heap than the
-# synthetic runs: main.py runs run_real.py with these JVM args and at most
+# synthetic runs: main.py runs the real step with these JVM args and at
+# most
 # REAL_MAX_WORKERS workers.
 REAL_JVM_ARGS = "-Xmx3g -Xss10M"
 REAL_MAX_WORKERS = 4

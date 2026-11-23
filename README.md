@@ -33,9 +33,9 @@ python main.py
 ```
 
 `main.py` runs the drift-ensemble pipeline (steps 1–6), then the DDD experiment (steps 7–8)
-and DDD on the real datasets (step 9).
-Every step is resumable, so a re-run only does the work that is missing. Without `--yes`,
-each long step prints a time estimate and asks for confirmation.
+and DDD on the real datasets (step 9). Each step runs as its own process, and the run stops
+at the first failure. Every step is resumable, so a re-run only does the work that is
+missing. Without `--yes`, each long step prints a time estimate and asks for confirmation.
 
 | `main.py` flag | Meaning |
 |---|---|
@@ -45,22 +45,24 @@ each long step prints a time estimate and asks for confirmation.
 | `--dry-run` | Print the steps without running them |
 
 Each JVM may grow to 8 GB by default. On machines with less RAM, cap it before running:
-`export CAPYMOA_JVM_ARGS="-Xmx1g -Xss10M"`. Step 9 always runs with `-Xmx3g -Xss10M` and at
-most 4 workers, because the real datasets have up to 830k instances.
+`export CAPYMOA_JVM_ARGS="-Xmx1g -Xss10M"`. The `real` step always runs with
+`-Xmx3g -Xss10M` and at most 4 workers, because the real datasets have up to 830k instances.
 
-You can also run the steps one at a time:
+You can also run one step at a time: `python main.py STEP [--workers N] [--yes] [options]`.
+`python main.py STEP -h` lists a step's options.
 
-| Step | Command | Flags |
-|---|---|---|
-| 1 | `python drift_ensemble/scripts/01_cache_tuning_streams.py` | `--workers`, `--yes` |
-| 2 | `python drift_ensemble/scripts/02_tune.py` | `--workers`, `--yes`, `--limit N` (first N configs only) |
-| 3 | `python drift_ensemble/scripts/03_select_params.py` | `--objective f1\|f2\|delay_auc` |
-| 4 | `python drift_ensemble/scripts/03b_tune_min_instances.py` | `--workers`, `--yes` |
-| 5 | `python drift_ensemble/scripts/04_run_test.py` | `--workers`, `--yes`, `--methods a,b` |
-| 6 | `python drift_ensemble/scripts/05_analyze.py` | `--no-plots` |
-| 7 | `python ensemble_experiment/run_experiment.py` | `--workers`, `--yes`, `--generators`, `--modes`, `--seeds`, `--methods` |
-| 8 | `python ensemble_experiment/analyze.py` | none |
-| 9 | `python ensemble_experiment/run_real.py` | `--workers`, `--yes`, `--datasets`, `--methods` |
+| # | Step | What it does | Options |
+|---|---|---|---|
+| 1 | `cache` | cache the tree errors of the 18 tuning streams | |
+| 2 | `tune` | tuning phase 1: every grid config on the tuning streams | `--limit N` |
+| 3 | `select` | tuning phase 1: best config per detector × mode | `--objective` |
+| 4 | `phase2` | tuning phase 2: each cluster's shared minimum | |
+| 5 | `test` | run the 7 methods on the 60 test streams | `--methods` |
+| 6 | `stats` | statistics of experiment 1 | `--no-plots` |
+| 7 | `ddd` | extended DDD on the synthetic streams | `--generators`, `--modes`, `--seeds`, `--methods` |
+| 8 | `ddd-stats` | statistics of the DDD runs | |
+| 9 | `real` | DDD on the real datasets, and their statistics | `--datasets`, `--methods` |
+| – | `screen` | DDM, HDDMAverage and ADWIN screened against the 4 (not in the full run) | |
 
 Tests: `python -m pytest` runs both suites. `python -m pytest -m "not jvm"` runs only the fast
 unit tests, which need no JVM.
@@ -110,9 +112,9 @@ classification function. The seed fixes the whole stream.
 - **Scoring:** an alarm is a true positive if it falls in `[drift start, drift end + 500]`.
   The metrics are precision, recall, F1, delay and false-alarm rate, with Wilcoxon tests on F1.
   `statistics/drift_ensemble/` holds, for every method × mode:
-  - medians of precision, recall, F1 and delay;
-  - curves of how they change as the allowed delay shrinks from 500 to 0;
-  - histograms of each metric.
+  - mean ± std of precision, recall and F1 over the runs, and the median delay;
+  - recall as the allowed delay shrinks from 500 to 0;
+  - bar charts per mode (singles and ensembles).
 
 **Experiment 2: extended DDD.**
 - **Streams:** 3 generators × 4 modes × 10 seeds, with 8 drifts per stream, one every 5,000
@@ -140,35 +142,24 @@ All hyperparameters are in each experiment's `config.py`.
 ## Layout
 
 ```
-main.py                runs both experiments end to end
+main.py                every step of both experiments (the only entry point)
 streams.py             shared stream generator (all 4 modes)
 drift_ensemble/        experiment 1
   config.py            every setting of the experiment (also sets JAVA_HOME)
-  cache.py             one tree pass per stream -> cached 0/1 errors + ground truth
-  detectors.py         detector factory, grids, mid-stream threshold control
-  tuning.py, selection.py   grid evaluation, best config per detector x mode (phase 1)
-  min_instances.py     phase 2: each cluster's shared minimum + re-tuned params
-  ensemble.py          raw / reset-all / cluster-vote / cluster-sens ensembles
-  workflow.py, runio.py     one method on one test stream, result folders
-  evaluation.py        alarm <-> drift matching and metrics
+  detectors.py         detectors (factory, grids, thresholds, phase-2 gate) and the
+                       reset-all / cluster-vote / cluster-sens ensembles
+  tuning.py            tuning phase 1 and 2, detector screening
+  runs.py              tree-error cache, one method on one test stream, result folders
+  stats.py             alarm <-> drift scoring, per-method statistics
   analysis.py          tables and plots (reads result folders only)
-  stats.py             per-method statistics -> statistics/drift_ensemble/
-  screening.py         DDM / HDDMAverage / ADWIN screened against the 4 (singles,
-                       cached errors; scripts/screen_detectors.py)
-  cli.py               shared CLI helpers (time estimate, workers)
-  scripts/             01-05 pipeline steps (+ 03b, tuning phase 2)
-  tests/
+  tests/               test_detectors, test_tuning, test_runs, test_stats
 ensemble_experiment/   experiment 2
   config.py            every setting of the experiment
-  bagging.py           online bagging over Hoeffding trees
-  ddd.py               extended DDD state machine
-  tracker.py, cap.py, pool.py   accuracy trackers, adaptive cap, concept pool
-  detection.py         experiment 1's methods as DDD drift signals
-  logger.py, runner.py      one run -> result folder
-  analysis.py          best-method statistics (reads result folders only)
-  real.py              DDD on the real datasets (data/ downloaded from OpenML)
-  run_experiment.py, analyze.py, run_real.py   CLIs
-  tests/
+  ddd.py               extended DDD state machine (+ trackers, adaptive cap, concept pool)
+  models.py            online bagging over Hoeffding trees, drift signals
+  runs.py              one run -> result folder (synthetic and real datasets)
+  analysis.py          statistics (reads result folders only)
+  tests/               test_ddd, test_runs, test_analysis
 results/
   results_drift_ensemble/   cache/  tuning/  test/  screening/
   results_ensemble/         runs/<generator>,<mode>,<seed>,<method>/  real/
@@ -182,8 +173,8 @@ statistics/
 
 Only `results/results_drift_ensemble/tuning/` is in git. It holds the tuned detector
 parameters: `selected_params.json` (phase 1) and `cluster_params.json` (phase 2), which
-both experiments read. Everything else under `results/` is regenerated by
-`main.py`.
+both experiments read. Everything else under `results/` is regenerated by `main.py`. The
+real datasets are downloaded from OpenML into `data/` (not in git) on first use.
 
 ## capymoa 0.9.0 notes
 

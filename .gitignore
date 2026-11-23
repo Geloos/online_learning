@@ -14,5 +14,5 @@ results/results_drift_ensemble/screening/
 # Outputs of the extended-DDD experiment.
 results/results_ensemble/
 
-# Downloaded real datasets (ensemble_experiment/real.py).
+# Downloaded real datasets (`python main.py real`).
 data/

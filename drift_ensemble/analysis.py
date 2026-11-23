@@ -1,4 +1,4 @@
-"""Analysis of finished test runs (drift_ensemble/scripts/05_analyze.py).
+"""Analysis of finished test runs (`python main.py stats`).
 
 Reads ONLY result folders (never reruns experiments) and writes the tables
 and plots under statistics/drift_ensemble/analysis/ (results/ holds only run
@@ -18,14 +18,12 @@ import matplotlib
 import numpy as np
 import pandas as pd
 
+from drift_ensemble import config
+from drift_ensemble.runs import load_runs
+from drift_ensemble.stats import compute_metrics, match_alarms, per_type
+
 matplotlib.use("Agg", force=True)  # headless plotting for plotnine
 
-from drift_ensemble import config
-from drift_ensemble.evaluation import (
-    compute_metrics,
-    match_alarms,
-    per_type,
-)
 
 SINGLE_METHODS = [m for m in config.METHODS if m.startswith("single_")]
 ENSEMBLE_METHODS = [m for m in config.METHODS if m.startswith("ens_")]
@@ -55,21 +53,6 @@ def plots_dir():
 # ---------------------------------------------------------------------------
 # Loading
 # ---------------------------------------------------------------------------
-def load_runs(test_dir=None) -> list[dict]:
-    """Every finished run of a roster method under ``test_dir`` (default
-    config.TEST_DIR): dicts with dir, meta and alarms."""
-    test_dir = config.TEST_DIR if test_dir is None else test_dir
-    runs = []
-    if not test_dir.exists():
-        return runs
-    for meta_path in sorted(test_dir.glob("*/meta.json")):
-        meta = json.loads(meta_path.read_text())
-        if meta["method"] not in config.METHODS:
-            continue  # stale folder of a method dropped from the roster
-        folder = meta_path.parent
-        alarms = json.loads((folder / "alarms.json").read_text())["alarms"]
-        runs.append({"dir": folder, "meta": meta, "alarms": alarms})
-    return runs
 
 
 def _csv(run: dict, name: str) -> pd.DataFrame:
@@ -508,7 +491,7 @@ def analyze(make_plots: bool = True) -> dict:
     if not runs:
         raise FileNotFoundError(
             f"no finished runs under {config.TEST_DIR} — run "
-            f"drift_ensemble/scripts/04_run_test.py first")
+            f"`python main.py test` first")
     td = tables_dir()
     out: dict[str, pd.DataFrame] = {}
     failures: list[str] = []

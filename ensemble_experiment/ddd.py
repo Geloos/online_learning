@@ -4,12 +4,12 @@ For Dealing With Concept Drift", IEEE TKDE 2011), with three extensions:
 * drift-type awareness: min_steps after a detection, the drift is
   classified "fast" or "slow" from the accuracy drop of the old-low
   ensemble against the main model's pre-drift accuracy,
-* an adaptive per-kind cap on the after-drift mode (cap.AdaptiveCap),
+* an adaptive per-kind cap on the after-drift mode (AdaptiveCap),
 * a concept pool of frozen past ensembles, one of which may be recalled as
-  a fifth voter (pool.ConceptPool).
+  a fifth voter (ConceptPool).
 
 The drift signal is any object with ``update(t, err) -> bool`` and
-``reset()`` (ensemble_experiment.detection). Ensembles come from a
+``reset()`` (ensemble_experiment.models). Ensembles come from a
 ``make_ensemble()`` factory and need ``predict(inst)``, ``learn(inst,
 lam)`` and ``frozen_copy()`` — both injected so the state machine is
 unit-testable without a JVM. The ground truth is never seen here.
@@ -18,14 +18,188 @@ Two choices beyond the spec, both because the WATCHED model changes:
   (a) every detection resets the whole drift signal (the new-low ensemble
       it watches is replaced by a fresh one);
   (b) an exit whose winner is not the current new-low also resets it.
+
+The parts it uses (accuracy trackers, adaptive cap, concept pool)
+are defined first.
 """
 
 from __future__ import annotations
 
-from ensemble_experiment.cap import AdaptiveCap
-from ensemble_experiment.pool import ConceptPool
-from ensemble_experiment.tracker import PrequentialTracker, SlidingAcc
+import math
+from collections import deque
 
+import numpy as np
+
+
+# ===========================================================================
+# Accuracy trackers
+#
+# Accuracy trackers used by the DDD state machine.
+# ===========================================================================
+class PrequentialTracker:
+    """Accuracy since the last reset, plus its binomial standard deviation
+    std = sqrt(acc * (1 - acc) / n). Minku & Yao do not define std; the
+    binomial form is our choice (std = 0 when n = 0)."""
+
+    __slots__ = ("n", "n_correct")
+
+    def __init__(self):
+        self.n = 0
+        self.n_correct = 0
+
+    def reset(self) -> None:
+        self.n = 0
+        self.n_correct = 0
+
+    def update(self, correct: bool) -> None:
+        self.n += 1
+        self.n_correct += int(bool(correct))
+
+    @property
+    def acc(self) -> float:
+        return self.n_correct / self.n if self.n else 0.0
+
+    @property
+    def std(self) -> float:
+        if self.n == 0:
+            return 0.0
+        a = self.acc
+        return math.sqrt(a * (1.0 - a) / self.n)
+
+    def copy(self) -> "PrequentialTracker":
+        other = PrequentialTracker()
+        other.n = self.n
+        other.n_correct = self.n_correct
+        return other
+
+
+class SlidingAcc:
+    """Accuracy over the last ``window`` correctness values (None if empty)."""
+
+    def __init__(self, window: int):
+        self.values: deque = deque(maxlen=window)
+        self._sum = 0
+
+    def reset(self) -> None:
+        self.values.clear()
+        self._sum = 0
+
+    def update(self, correct: bool) -> None:
+        v = int(bool(correct))
+        if len(self.values) == self.values.maxlen:
+            self._sum -= self.values[0]
+        self.values.append(v)
+        self._sum += v
+
+    @property
+    def acc(self) -> float | None:
+        return self._sum / len(self.values) if self.values else None
+
+
+# ===========================================================================
+# Adaptive cap
+#
+# Adaptive per-kind cap on the length of DDD's after-drift mode.
+#
+# Each drift kind ("fast" / "slow") has its own cap. It starts at cap_init.
+# After cap_min_history natural exits of that kind it becomes
+# clip(margin * p90(recent natural exit times), floor, ceil). A forced exit
+# multiplies it by growth (capped at ceil) and is NOT recorded as an exit
+# time — recording the cap-length episodes would feed the cap back into
+# itself.
+# ===========================================================================
+KINDS = ("fast", "slow")
+
+
+class AdaptiveCap:
+    def __init__(self, *, cap_init, cap_floor, cap_ceil, cap_margin,
+                 cap_growth, cap_history, cap_min_history):
+        self.floor = cap_floor
+        self.ceil = cap_ceil
+        self.margin = cap_margin
+        self.growth = cap_growth
+        self.min_history = cap_min_history
+        self.cap = {k: float(cap_init) for k in KINDS}
+        self.exit_times = {k: deque(maxlen=cap_history) for k in KINDS}
+        self.n_natural = {k: 0 for k in KINDS}
+        self.n_forced = {k: 0 for k in KINDS}
+
+    @classmethod
+    def from_cfg(cls, cfg: dict) -> "AdaptiveCap":
+        keys = ("cap_init", "cap_floor", "cap_ceil", "cap_margin",
+                "cap_growth", "cap_history", "cap_min_history")
+        return cls(**{k: cfg[k] for k in keys})
+
+    def get(self, kind: str) -> float:
+        return self.cap[kind]
+
+    def on_natural_exit(self, kind: str, steps: int) -> None:
+        self.exit_times[kind].append(steps)
+        self.n_natural[kind] += 1
+        if len(self.exit_times[kind]) >= self.min_history:
+            p90 = float(np.percentile(list(self.exit_times[kind]), 90))
+            self.cap[kind] = float(np.clip(self.margin * p90,
+                                           self.floor, self.ceil))
+
+    def on_forced_exit(self, kind: str) -> None:
+        self.n_forced[kind] += 1
+        self.cap[kind] = min(self.ceil, self.cap[kind] * self.growth)
+
+
+# ===========================================================================
+# Concept pool
+#
+# Concept pool: frozen ensembles of past concepts, FIFO eviction.
+#
+# Stored ensembles never learn. Recall works on a copy; a recalled ensemble
+# that wins its episode overwrites its own entry (no duplicate).
+# ===========================================================================
+class ConceptPool:
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self.entries: list[dict] = []  # oldest first
+        self._next_id = 0
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def add(self, ensemble, step: int) -> tuple[int | None, int | None]:
+        """Store a frozen ensemble. Returns (new id, evicted id). With
+        max_size 0 the pool is disabled and nothing is stored."""
+        if self.max_size <= 0:
+            return None, None
+        evicted = None
+        if len(self.entries) >= self.max_size:
+            evicted = self.entries.pop(0)["id"]
+        entry_id = self._next_id
+        self._next_id += 1
+        self.entries.append({"id": entry_id, "ensemble": ensemble,
+                             "created_step": step, "updated_step": step})
+        return entry_id, evicted
+
+    def get(self, entry_id: int) -> dict | None:
+        for e in self.entries:
+            if e["id"] == entry_id:
+                return e
+        return None
+
+    def replace(self, entry_id: int, ensemble, step: int) -> bool:
+        """Overwrite an entry's ensemble in place (its FIFO position is
+        kept). False if the entry was evicted meanwhile."""
+        e = self.get(entry_id)
+        if e is None:
+            return False
+        e["ensemble"] = ensemble
+        e["updated_step"] = step
+        return True
+
+    def ids(self) -> list[int]:
+        return [e["id"] for e in self.entries]
+
+
+# ===========================================================================
+# Extended DDD
+# ===========================================================================
 VOTERS = ("nl", "ol", "oh", "rc")  # new-low, old-low, old-high, recalled
 WINNER_ATTR = {"nl": "new_low", "ol": "old_low", "oh": "old_high",
                "rc": "recalled"}

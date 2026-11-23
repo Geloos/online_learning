@@ -2,14 +2,60 @@
 this study lives here (the stream generators themselves are defined in the
 shared root module streams.py).
 
-Importing this module also sets JAVA_HOME (needed by capymoa) — modules that
+Importing this module also sets JAVA_HOME (needed by capymoa; see
+ensure_java_home below) — modules that
 import capymoa must import drift_ensemble.config first.
 """
 
+from __future__ import annotations
+
+import os
+import subprocess
 import sys
 from pathlib import Path
 
-from drift_ensemble._java import ensure_java_home
+
+# ===========================================================================
+# JAVA_HOME
+#
+# JAVA_HOME bootstrap.
+#
+# CapyMOA runs MOA through a JVM (via jpype) and needs JAVA_HOME. On this
+# machine java is on PATH but JAVA_HOME is not set, so we derive it from the
+# JVM's own ``java.home`` property before any capymoa import happens.
+#
+# Import order contract: every module that (directly or indirectly) imports
+# capymoa must import ``drift_ensemble.config`` first, which calls
+# ``ensure_java_home()`` at import time.
+# ===========================================================================
+def ensure_java_home() -> str:
+    """Set os.environ['JAVA_HOME'] from the running JVM if it is unset."""
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        return java_home
+    try:
+        proc = subprocess.run(
+            ["java", "-XshowSettings:properties", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "JAVA_HOME is not set and 'java' was not found on PATH. "
+            "Install a JDK 11+ or set JAVA_HOME."
+        ) from exc
+    # -XshowSettings prints the properties on stderr.
+    for line in proc.stderr.splitlines():
+        line = line.strip()
+        if line.startswith("java.home"):
+            java_home = line.split("=", 1)[1].strip()
+            os.environ["JAVA_HOME"] = java_home
+            return java_home
+    raise RuntimeError(
+        "Could not derive JAVA_HOME from 'java -XshowSettings:properties'. "
+        "Set JAVA_HOME manually."
+    )
 
 ensure_java_home()
 
@@ -139,7 +185,7 @@ DEFAULT_PARAMS = {
 
 # ---------------------------------------------------------------------------
 # Tuning phase 2: a shared minimum per cluster
-# (drift_ensemble/min_instances.py, scripts/03b_tune_min_instances.py).
+# (tuning.py, `python main.py phase2`).
 #
 # Each detector has its own minimum number of instances after a reset
 # before it can fire (measured by probe on 2026-11-23, 0s then 1s right
@@ -168,7 +214,7 @@ MIN_INSTANCES_GRID = [50, 100, 200, 300, 500, 1000, 2000]
 CLUSTER_PARAMS_PATH = TUNING_DIR / "cluster_params.json"
 
 # ---------------------------------------------------------------------------
-# Detector screening (drift_ensemble/scripts/screen_detectors.py): extra
+# Detector screening (`python main.py screen`, tuning.py): extra
 # capymoa detectors tuned and tested as singles on the CACHED errors only, to
 # see whether one beats the study's 4 on ABRUPT / GRADUAL F1. They are NOT
 # in the roster, the clusters or the ensembles. These grids are our own

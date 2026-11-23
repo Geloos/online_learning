@@ -1,18 +1,225 @@
-"""JVM-free tests of the ExtendedDDD state machine (fake ensembles and a
-scripted drift signal)."""
+"""Extended DDD: its parts and the state machine, with fake ensembles and
+signals (no JVM).
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
 
 import pytest
 
 from ensemble_experiment import config
-from ensemble_experiment.ddd import ExtendedDDD
-from ensemble_experiment.tests.fakes import (
-    FakeEnsemble,
-    FakeFactory,
-    FakeInst,
-    StubSignal,
+from ensemble_experiment.ddd import (
+    AdaptiveCap,
+    ConceptPool,
+    ExtendedDDD,
+    PrequentialTracker,
+    SlidingAcc,
 )
+from ensemble_experiment.models import majority
 
 
+# ===========================================================================
+# Fakes
+#
+# Duck-typed fakes for JVM-free tests of the DDD state machine.
+# ===========================================================================
+_ids = itertools.count()
+
+
+class FakeInst:
+    def __init__(self, y: int = 0):
+        self.y_index = y
+
+
+class FakeEnsemble:
+    """Predicts ``pred`` (settable); records learn calls into an optional
+    shared event log as ('predict'|'learn', ensemble id)."""
+
+    def __init__(self, pred=0, log=None):
+        self.id = next(_ids)
+        self.pred = pred
+        self.log = log
+        self.learned: list[float] = []
+        self.copied_from = None
+
+    def predict(self, inst):
+        if self.log is not None:
+            self.log.append(("predict", self.id))
+        return self.pred
+
+    def learn(self, inst, lam):
+        self.learned.append(lam)
+        if self.log is not None:
+            self.log.append(("learn", self.id))
+
+    def frozen_copy(self):
+        c = FakeEnsemble(self.pred, self.log)
+        c.copied_from = self
+        return c
+
+
+class FakeFactory:
+    def __init__(self, pred=0, log=None):
+        self.pred = pred
+        self.log = log
+        self.made: list[FakeEnsemble] = []
+
+    def __call__(self):
+        e = FakeEnsemble(self.pred, self.log)
+        self.made.append(e)
+        return e
+
+
+class StubSignal:
+    """Fires on the scripted t values; counts resets."""
+
+    def __init__(self, fire_at=()):
+        self.fire_at = set(fire_at)
+        self.seen: list[tuple[int, int]] = []
+        self.resets = 0
+        self.alarms: list[int] = []
+        self.raw_fires: list[dict] = []
+        self.logs: dict = {}
+
+    def update(self, t, err):
+        self.seen.append((t, err))
+        if t in self.fire_at:
+            self.alarms.append(t)
+            return True
+        return False
+
+    def reset(self):
+        self.resets += 1
+
+
+# ===========================================================================
+# Parts
+# ===========================================================================
+CAP = dict(cap_init=500, cap_floor=100, cap_ceil=2000, cap_margin=1.5,
+           cap_growth=1.25, cap_history=10, cap_min_history=3)
+
+
+# --- trackers ---------------------------------------------------------------
+def test_prequential_tracker_acc_std_reset():
+    tr = PrequentialTracker()
+    assert tr.acc == 0.0 and tr.std == 0.0
+    for c in [1, 1, 1, 0]:
+        tr.update(c)
+    assert tr.acc == 0.75
+    assert tr.std == pytest.approx(math.sqrt(0.75 * 0.25 / 4))
+    cp = tr.copy()
+    tr.reset()
+    assert tr.n == 0 and cp.n == 4 and cp.acc == 0.75
+
+
+def test_sliding_acc_window():
+    s = SlidingAcc(3)
+    assert s.acc is None
+    for c in [1, 1, 0, 0]:
+        s.update(c)
+    assert s.acc == pytest.approx(1 / 3)  # window = [1, 0, 0]
+    s.reset()
+    assert s.acc is None
+
+
+# --- cap ----------------------------------------------------------------------
+def test_cap_fallback_before_min_history():
+    cap = AdaptiveCap(**CAP)
+    cap.on_natural_exit("fast", 100)
+    cap.on_natural_exit("fast", 120)
+    assert cap.get("fast") == 500  # only 2 < 3 natural exits
+    assert cap.get("slow") == 500
+
+
+def test_cap_p90_update_and_kinds_independent():
+    cap = AdaptiveCap(**CAP)
+    for s in [100, 200, 300]:
+        cap.on_natural_exit("fast", s)
+    # p90 of [100, 200, 300] = 280 -> 1.5 * 280 = 420
+    assert cap.get("fast") == pytest.approx(420)
+    assert cap.get("slow") == 500
+
+
+def test_cap_clip_bounds():
+    cap = AdaptiveCap(**CAP)
+    for s in [10, 10, 10]:
+        cap.on_natural_exit("fast", s)
+    assert cap.get("fast") == 100  # floor
+    for s in [5000, 5000, 5000]:
+        cap.on_natural_exit("slow", s)
+    assert cap.get("slow") == 2000  # ceil
+
+
+def test_cap_forced_exit_grows_and_is_not_recorded():
+    cap = AdaptiveCap(**CAP)
+    cap.on_forced_exit("slow")
+    assert cap.get("slow") == pytest.approx(625)
+    assert len(cap.exit_times["slow"]) == 0
+    for _ in range(20):
+        cap.on_forced_exit("slow")
+    assert cap.get("slow") == 2000
+
+
+# --- pool ---------------------------------------------------------------------
+def test_pool_fifo_eviction_and_replace():
+    pool = ConceptPool(2)
+    a, ev = pool.add("A", 1)
+    assert ev is None
+    b, _ = pool.add("B", 2)
+    c, ev = pool.add("C", 3)
+    assert ev == a and pool.ids() == [b, c]
+    assert pool.replace(b, "B2", 4)
+    assert pool.get(b)["ensemble"] == "B2"
+    assert pool.ids() == [b, c]  # replace keeps the FIFO position
+    assert not pool.replace(a, "X", 5)  # evicted
+
+
+def test_pool_disabled():
+    pool = ConceptPool(0)
+    assert pool.add("A", 1) == (None, None)
+    assert len(pool) == 0
+
+
+# --- bagging ------------------------------------------------------------------
+class _CountingTree:
+    def __init__(self):
+        self.calls = 0
+
+    def trainOnInstance(self, ji):
+        self.calls += 1
+
+
+class _Inst:
+    java_instance = object()
+
+
+def test_learn_trains_each_tree_exactly_k_times():
+    import numpy as np
+
+    from ensemble_experiment.models import OnlineBaggingEnsemble
+
+    trees = [_CountingTree() for _ in range(10)]
+    ens = OnlineBaggingEnsemble(trees, np.random.default_rng(3))
+    expected = np.random.default_rng(3).poisson(2.0, size=10)
+    ens.learn(_Inst(), 2.0)
+    assert [t.calls for t in trees] == [int(k) for k in expected]
+
+
+def test_majority_vote_ties_and_abstain():
+    assert majority([1, 1, 0]) == 1
+    assert majority([1, 0]) == 0  # tie -> lowest label
+    assert majority([None, 2, None]) == 2
+    assert majority([None, None]) is None
+
+
+# ===========================================================================
+# State machine
+#
+# JVM-free tests of the ExtendedDDD state machine (fake ensembles and a
+# scripted drift signal).
+# ===========================================================================
 def make_ddd(fire_at=(), log=None, **cfg_overrides):
     cfg = {**config.DDD, "min_steps": 5, "ref_window": 10,
            **cfg_overrides}

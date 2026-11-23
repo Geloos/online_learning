@@ -27,16 +27,22 @@ Always use the venv's Python from the repo root:
 
 ```
 .venv\Scripts\python.exe main.py [--workers N] [--yes] [--only drift_ensemble|ensemble_experiment] [--dry-run]
-.venv\Scripts\python.exe -m pytest                  # both suites (~15 s)
+.venv\Scripts\python.exe main.py STEP [--workers N] [--yes] [step options]   # one step; STEP -h
+.venv\Scripts\python.exe -m pytest                  # both suites (~20 s)
 .venv\Scripts\python.exe -m pytest -m "not jvm"     # unit tests only, no JVM startup
-.venv\Scripts\python.exe -m pytest drift_ensemble/tests/test_cluster_vote.py::test_name
+.venv\Scripts\python.exe -m pytest drift_ensemble/tests/test_detectors.py::test_name
 ```
 
-`main.py` runs `drift_ensemble/scripts/01, 02, 03, 03b, 04, 05`, then
-`ensemble_experiment/run_experiment.py`, `analyze.py` and `run_real.py` (9 steps). It runs
-each step as a subprocess and stops at the first failure.
-- The real-data step runs with `CAPYMOA_JVM_ARGS="-Xmx3g -Xss10M"` and at most 4 workers
-  (`config.REAL_JVM_ARGS`, `REAL_MAX_WORKERS`); main.py sets that for this step only.
+`main.py` is the only entry point. Every step is a subcommand: `cache`, `tune`, `select`,
+`phase2`, `test`, `stats` (experiment 1), then `ddd`, `ddd-stats` and `real` (experiment 2).
+`screen` exists too but isn't part of the full run. Without a step, main.py runs the 9 in
+order, each as a subprocess, and stops at the first failure.
+- **Layout:** restructured on 2026-11-23 at the user's request, because they found it
+  overengineered. It went from 66 to 24 `.py` files: no `scripts/` folders, one module per
+  topic, one test file per module. Don't split it back into many small files.
+  `main.run_pool` is the one time-one-unit → confirm → worker-pool loop that every step uses.
+- The `real` step sets `CAPYMOA_JVM_ARGS="-Xmx3g -Xss10M"` itself and uses at most 4 workers
+  (`config.REAL_JVM_ARGS`, `REAL_MAX_WORKERS`).
 - Every step is resumable: finished work is skipped.
 - Long steps time one unit, print an estimate and wait for confirmation. `--yes` skips the
   prompt; it is required when running non-interactively.
@@ -45,7 +51,7 @@ each step as a subprocess and stops at the first failure.
 - capymoa lets every JVM grow to 8 GB by default. A 6-worker DDD run was killed for low
   memory here, so set `CAPYMOA_JVM_ARGS="-Xmx1g -Xss10M"`.
 
-After `03_select_params.py`, `results/results_drift_ensemble/tuning/tuning_summary.csv` must
+After the `select` step, `results/results_drift_ensemble/tuning/tuning_summary.csv` must
 justify `CLUSTER_MEMBERS` in `drift_ensemble/config.py`. Since 2026-11-20 (re-tuned with
 `MAX_DELAY = 500`) the split is HDDMWeighted/RDDM = ABRUPT and STEPD/SEED = GRADUAL.
 - A detector always runs with its cluster's params, so it goes where those params hurt it least
@@ -54,18 +60,18 @@ justify `CLUSTER_MEMBERS` in `drift_ensemble/config.py`. Since 2026-11-20 (re-tu
   detector scores higher on GRADUAL.
 - The old 1000-window split, its tuning files and its runs were deleted on 2026-11-23 at the
   user's request. Don't bring them back up.
-- `main.py` prints a reminder after step 3 but does not stop. Phase 2 (03b) keeps this split.
+- The `select` step prints a reminder but does not stop. Phase 2 keeps this split.
 
 ## Critical: import order and sys.path
 
-CapyMOA needs `JAVA_HOME`, which is unset on this machine. `drift_ensemble/_java.py` derives
-it from `java -XshowSettings:properties` when `drift_ensemble.config` is imported. **Every
+CapyMOA needs `JAVA_HOME`, which is unset on this machine. `drift_ensemble/config.py`
+(`ensure_java_home`) derives it from `java -XshowSettings:properties` when it is imported. **Every
 module that imports capymoa (directly or indirectly) must import `drift_ensemble.config`
 first** (`ensemble_experiment.config` does so). `streams.stream_from_plan` calls
 `ensure_java_home()` itself.
 
 `drift_ensemble.config` also puts the repo root on `sys.path`, so `import streams` works.
-The scripts and test conftests bootstrap the root too.
+`main.py` and pytest (`pythonpath = .` in `pytest.ini`) put it there too.
 
 ## Shared: `streams.py` (root)
 
@@ -90,16 +96,26 @@ There are 60 test streams: 3 generators × {ABRUPT, GRADUAL, MIXED, RECURRING} �
   were verified unchanged.
 - Tuning still uses ABRUPT and GRADUAL only.
 
-- **`cache.py`:** runs one HT pass per stream and stores `errors.npy`, `ht_accuracy.npy` and
-  `ground_truth.json` under `cache/`. HT's error sequence is deterministic given the stream,
-  so **everything downstream replays these cached errors**. `tests/test_cache_replay.py`
-  proves equivalence with a live run.
-- **Tuning phase 1:** `detectors.py` (factory, grids, `set_threshold`) → `tuning.py` (grid ×
-  cached errors) → `selection.py` (best config per detector × mode, plus a LOGO check) →
-  `selected_params.json`. The singles and `ens_raw_resetall` run with it (both experiments),
-  as do screening and the cluster-split check.
-- **Tuning phase 2** (`min_instances.py`, `scripts/03b_tune_min_instances.py`, added
-  2026-11-23 at the user's request): one shared minimum M per cluster, so a cluster's two
+Modules:
+- `config.py`: every setting, plus `ensure_java_home`.
+- `detectors.py`: detector factory, grids, `set_threshold`, the phase-2 gate, and the 3
+  ensemble classes.
+- `tuning.py`: phase 1, phase 2 and screening.
+- `runs.py`: HT error cache, which params a method uses, one method on one stream, and run
+  folders (save + `load_runs`).
+- `stats.py`: scoring (`match_alarms`, `compute_metrics`, `delay_curve`) and the statistics.
+- `analysis.py`: tables and plots.
+
+- **Cache (`runs.py`, step `cache`; `test` caches the test streams):** runs one HT pass per
+  stream and stores `errors.npy`, `ht_accuracy.npy` and `ground_truth.json` under `cache/`.
+  HT's error sequence is deterministic given the stream, so **everything downstream replays
+  these cached errors**. `tests/test_runs.py` proves equivalence with a live run.
+- **Tuning phase 1 (`tuning.py`, steps `tune` + `select`):** grid × cached errors → best
+  config per detector × mode, plus a LOGO check → `selected_params.json`. The singles and
+  `ens_raw_resetall` run with it (both experiments), as do screening and the cluster-split
+  check.
+- **Tuning phase 2** (`tuning.py`, step `phase2`, added 2026-11-23 at the user's request):
+  one shared minimum M per cluster, so a cluster's two
   detectors switch back on together after every reset. The user wanted M_A and M_G tuned
   separately; they're equal only if tuning says so.
   - Own minimums (probe, 0s then 1s after a reset): STEPD 2 × window_size, SEED
@@ -117,10 +133,10 @@ There are 60 test streams: 3 generators × {ABRUPT, GRADUAL, MIXED, RECURRING} �
   - **Only the two-vote methods use phase 2** (`config.PHASE2_METHODS`: `ens_cluster_vote`,
     `ens_cluster_sens`; the user's choice). The singles and `ens_raw_resetall` use phase 1
     with no minimum. This holds in both experiments, so the real data (`ens_raw_resetall`)
-    uses phase 1. `workflow.method_params` picks the file, and `build_detector` gates when the
+    uses phase 1. `runs.method_params` picks the file, and `build_detector` gates when the
     dict has `min_instances`. `meta.json` stores the params used.
-- **`ensemble.py`:** `RawResetAllEnsemble`, `ClusterVoteEnsemble` and
-  `ClusterSensitivityEnsemble`. `workflow.run_method` runs the 7 roster methods
+- **Ensembles (`detectors.py`):** `RawResetAllEnsemble`, `ClusterVoteEnsemble` and
+  `ClusterSensitivityEnsemble`. `runs.run_method` runs the 7 roster methods
   (`config.METHODS`), the same 7 as experiment 2:
   - `single_*` ×4.
   - `ens_raw_resetall`: OR; every alarm resets ALL detectors.
@@ -132,12 +148,11 @@ There are 60 test streams: 3 generators × {ABRUPT, GRADUAL, MIXED, RECURRING} �
   - `ens_cluster_sens`: same pair rule and reset-all. The later voter's threshold becomes
     more sensitive, scaled by its lag. Levels only rise, capped at `L_MAX`, and are applied
     mid-stream via `detectors.set_threshold`.
-  - `workflow.build_method_ensemble` builds the three ensemble classes. Experiment 2 reuses
-    it.
-- **Outputs:** `runio.py` defines the run-folder format (alarms.json, weights.csv,
-  sensitivity.csv, raw_fires.csv, meta.json). `analysis.py` reads *only* result folders and
-  must never recompute from streams.
-- **Statistics:** `stats.py` is called by `05_analyze.py` after `analysis.py`. It covers all 7
+  - `runs.build_method_ensemble` builds the three ensemble classes. Experiment 2 reuses it.
+- **Outputs:** `runs.py` defines the run-folder format (alarms.json, weights.csv,
+  sensitivity.csv, raw_fires.csv, meta.json). `analysis.py` and `stats.py` read *only*
+  result folders and must never recompute from streams.
+- **Statistics:** `stats.py` is called by the `stats` step after `analysis.py`. It covers all 7
   methods and writes to `statistics/drift_ensemble/`:
   - `runs.csv` and `delays.csv`, which has one row per detected drift;
   - `metrics.csv`: per method × mode, the **mean and std** over runs of precision, recall
@@ -164,16 +179,16 @@ There are 60 test streams: 3 generators × {ABRUPT, GRADUAL, MIXED, RECURRING} �
     and `detection_medians.csv` were dropped because they duplicated `stats.py`.
   - The file is named `stats.py` rather than `statistics.py` so it doesn't shadow the
     stdlib module.
-- **Detector screening:** `screening.py` and `scripts/screen_detectors.py` were added on
-  2026-11-20 and are not part of `main.py`. They tune DDM, HDDMAverage and ADWIN
+- **Detector screening** (`tuning.py`, step `screen`, added 2026-11-20, not part of the
+  full run): it tunes DDM, HDDMAverage and ADWIN
   (`config.SCREENING_GRIDS`, our own ranges) as single detectors on the cached errors, then
   score them on the ABRUPT and GRADUAL test streams.
   - The study's 4 are scored the same way, each with its params for the stream's mode.
   - Raw rows go to `results/results_drift_ensemble/screening/`; the summary goes to
     `statistics/drift_ensemble/screening.csv`.
   - The roster, the clusters and the ensembles are unchanged.
-- **Scripts:** `scripts/01..05` are thin CLIs; shared CLI helpers live in `cli.py`.
-- **Tests:** in `tests/`, using `StubDetector` from `tests/fakes.py`. JVM tests carry the `jvm`
+- **Tests:** one file per module in `tests/` (`test_detectors`, `test_tuning`, `test_runs`,
+  `test_stats`). `StubDetector` is defined in `test_detectors.py`. JVM tests carry the `jvm`
   marker.
 
 ## Experiment 2: `ensemble_experiment/`
@@ -188,14 +203,15 @@ All parameters are in `config.py`:
 The full grid is 840 runs; each takes about 17 s. Results go under
 `results/results_ensemble/runs/` (`meta.json` written last means done).
 
-- **`bagging.py`:** online bagging that drives the Java `moa_learner` of capymoa
-  HoeffdingTrees (NB-adaptive leaves).
-- **`ddd.py`:** the state machine. Ensembles and signal are injected, so the tests use fakes.
-- **`detection.py`:** wraps experiment 1's methods as signals, with the same params as
-  experiment 1 (phase 1 or phase 2 per method, `load_method_params`).
-- **`logger.py`:** matches DDD's behaviour against the ground truth: TP/FP, pool concept tags
+- **`models.py`:** online bagging that drives the Java `moa_learner` of capymoa
+  HoeffdingTrees (NB-adaptive leaves), and the drift signals: experiment 1's methods with
+  the same params as there (phase 1 or phase 2 per method, `load_method_params`).
+- **`ddd.py`:** the state machine, plus its parts (accuracy trackers, adaptive cap, concept
+  pool). Ensembles and signal are injected, so the tests use fakes (`tests/test_ddd.py`).
+- **`runs.py`:** one run → one folder, synthetic (step `ddd`) and real (step `real`).
+  `RunLogger` matches DDD's behaviour against the ground truth: TP/FP, pool concept tags
   and recall hits.
-- **`analysis.py`:** reads run folders only (`correct.npy` holds every instance, so no
+- **`analysis.py`** (steps `ddd-stats`, `real`): reads run folders only (`correct.npy` holds every instance, so no
   re-runs). Writes statistics for the best method only (`config.STATS["method"]`,
   `ens_raw_resetall`) to `statistics/ensemble_experiment/`, outside `results/`, which
   holds only run outcomes. Per mode it writes `recovery.csv` and `drifts.csv` and plots
@@ -213,10 +229,10 @@ The full grid is 840 runs; each takes about 17 s. Results go under
     ≥ 95% of the before accuracy. It's only checked after 50 instances.
 - **Live runs:** runs are live. No error cache is possible because DDD's errors depend on its
   own alarms.
-- **Real data (`real.py`, `run_real.py`, added 2026-11-23; main.py's last step since the same
-  day):** extended DDD on Electricity, Airlines, Covtype and Poker (`config.REAL_DATASETS`).
-  Run Airlines, Covtype and Poker with `CAPYMOA_JVM_ARGS="-Xmx3g -Xss10M"`, since they're
-  540k–830k instances.
+- **Real data (step `real`, the full run's last step; runs in `runs.py`, statistics in
+  `analysis.py`; added 2026-11-23):** extended DDD on Electricity, Airlines, Covtype and
+  Poker (`config.REAL_DATASETS`). The step sets `CAPYMOA_JVM_ARGS="-Xmx3g -Xss10M"` itself,
+  since the datasets have 540k–830k instances.
   - The user's choices: only `ens_raw_resetall`, ONE run (seed 201, `REAL_SEED`), no
     more seeds.
   - There are no drift positions, so only prequential accuracy (after warm-up), the
@@ -239,7 +255,7 @@ The full grid is 840 runs; each takes about 17 s. Results go under
 
 - All four detectors restart their own statistics after `detected_change()`. They fire again
   without an explicit `reset()` (`DETECTOR_SELF_RESETS` in config.py).
-- `reset()` only clears the Python side. `ensemble.reset_detector` also calls MOA's
+- `reset()` only clears the Python side. `detectors.reset_detector` also calls MOA's
   `resetLearning()`.
 - `GradualDrift(position=...)` means the drift **center**, so we pass `start`/`end` instead. Its
   constructor prints a stray "None", which is suppressed in `streams.stream_from_plan`.
@@ -249,7 +265,7 @@ The full grid is 840 runs; each takes about 17 s. Results go under
   - STEPD/RDDM read options only in `prepareForUse`.
   - HDDM_W/SEED re-read them on `resetLearning`.
   - `detectors.set_threshold` sets Option **and** field, which survives every reset path
-    (`tests/test_set_threshold.py`).
+    (`tests/test_detectors.py`).
 - DDD frozen copies must use MOA `copy()`; Python `deepcopy` doesn't duplicate the Java tree.
 - Poisson bagging trains k separate times. A single weight-k call is NOT equivalent for
   NB-adaptive trees (93–100% prediction agreement).

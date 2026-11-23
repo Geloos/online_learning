@@ -27,21 +27,26 @@ stream; otherwise (MIXED, RECURRING: the order of abrupt and gradual drifts
 differs per seed) the blocks are aligned on each drift start, from
 STATS["pre"] before to STATS["post"] after, with the median over drifts and
 one line for abrupt and one for gradual drifts.
+
+Real datasets (no drift positions, real_statistics): accuracy.csv and
+accuracy_over_time.png per dataset under
+statistics/ensemble_experiment/real/<dataset>/.
 """
 
 from __future__ import annotations
 
 import json
 import warnings
+from pathlib import Path
 
 import matplotlib
-
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
-from ensemble_experiment import config  # noqa: E402
+from ensemble_experiment import config
+
 
 KEYS = ["generator", "mode", "seed", "method"]
 
@@ -285,3 +290,100 @@ def run_analysis(runs_dir=None, out_dir=None, method: str | None = None
         sel = [(d, m) for d, m in metas if m["mode"] == mode]
         plot_accuracy_200(sel, arrays, mode, method, out_dir)
     return summary
+
+
+# ===========================================================================
+# Real datasets (reads run folders only)
+# ===========================================================================
+COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+          "#e87ba4", "#008300", "#6250d6"]
+INK, MUTED, GRID = "#0b0b0b", "#52514e", "#e1e0d9"
+
+
+def load_real_runs(root=None) -> list[dict]:
+    root = config.REAL_RUNS_DIR if root is None else Path(root)
+    runs = []
+    for d in sorted(root.glob("*")) if root.exists() else []:
+        if (d / "meta.json").exists():
+            alarms = (json.loads((d / "alarms.json").read_text())["alarms"]
+                      if (d / "alarms.json").exists() else [])
+            runs.append({"meta": json.loads((d / "meta.json").read_text()),
+                         "correct": np.load(d / "correct.npy"),
+                         "alarms": alarms})
+    return runs
+
+
+def accuracy_table(runs):
+    """One row per dataset x method: prequential accuracy after the
+    warm-up (acc) and over every instance (acc_all), and the number of
+    detections."""
+    df = pd.DataFrame([{"dataset": r["meta"]["dataset"],
+                        "method": r["meta"]["method"],
+                        "seed": r["meta"]["seed"],
+                        "acc": r["meta"]["summary"]["acc"],
+                        "acc_all": r["meta"]["summary"]["acc_all"],
+                        "n_detections": r["meta"]["summary"]["n_detections"]}
+                       for r in runs])
+    df["method"] = pd.Categorical(df["method"], config.REAL_RUN_METHODS,
+                                  ordered=True)
+    return df.sort_values(["dataset", "method"]).reset_index(drop=True)
+
+
+def plot_accuracy(runs, dataset: str, out, block: int) -> None:
+    """Accuracy per block of ``block`` instances, one line per method; the
+    no-change baseline grey and dotted, DDD's detections as ticks."""
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+    for i, method in enumerate(config.REAL_RUN_METHODS):
+        rs = [r for r in runs if r["meta"]["dataset"] == dataset
+              and r["meta"]["method"] == method]
+        if not rs:
+            continue
+        r = rs[0]
+        c = r["correct"]
+        n = len(c) // block * block
+        acc = c[:n].reshape(-1, block).mean(axis=1)
+        x = (np.arange(len(acc)) + 0.5) * block
+        if method in config.REAL_BASELINES:
+            style = dict(color="#898781", lw=1.6, ls=":")
+        else:
+            style = dict(color=COLORS[i], lw=1.8, ls="-")
+        label = f"{method} (acc {r['meta']['summary']['acc']:.3f})"
+        ax.plot(x, acc, label=label, **style)
+        if r["alarms"]:
+            ax.plot(r["alarms"], np.full(len(r["alarms"]), 0.0), "|",
+                    color=style["color"], ms=12, mew=1.2,
+                    transform=ax.get_xaxis_transform(),
+                    label=f"{method} detections ({len(r['alarms'])})")
+    ax.axvline(config.MIN_TRAINING_SIZE, color=MUTED, lw=0.8)
+    ax.set_xlabel("instance", fontsize=9, color=MUTED)
+    ax.set_ylabel(f"accuracy per {block} instances", fontsize=9, color=MUTED)
+    ax.grid(color=GRID, lw=0.6)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0), fontsize=9,
+              frameon=False)
+    fig.suptitle(f"{dataset}: prequential accuracy over time",
+                 fontsize=12, color=INK)
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+
+
+def real_statistics(root=None, out_dir=None):
+    """accuracy.csv and accuracy_over_time.png per dataset."""
+    out_dir = config.REAL_STATS_DIR if out_dir is None else Path(out_dir)
+    runs = load_real_runs(root)
+    if not runs:
+        print("No finished real-data runs found.")
+        return None
+    table = accuracy_table(runs)
+    for dataset in table["dataset"].unique():
+        d = out_dir / dataset
+        d.mkdir(parents=True, exist_ok=True)
+        table[table["dataset"] == dataset].to_csv(d / "accuracy.csv",
+                                                  index=False)
+        plot_accuracy(runs, dataset, d / "accuracy_over_time.png",
+                      config.REAL_DATASETS[dataset]["acc_block"])
+    return table

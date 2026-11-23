@@ -180,7 +180,7 @@ def stream_from_plan(plan: dict):
     import io
 
     # capymoa needs JAVA_HOME before its first import.
-    from drift_ensemble._java import ensure_java_home
+    from drift_ensemble.config import ensure_java_home
 
     ensure_java_home()
     from capymoa.stream.drift import AbruptDrift, DriftStream, GradualDrift
