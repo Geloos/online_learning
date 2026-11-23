@@ -149,10 +149,83 @@ def set_threshold(det, name: str, value: float) -> None:
     field.setDouble(owner, float(value))
 
 
-def run_detector_on_errors(name: str, params: dict, errors) -> list[int]:
+# ---------------------------------------------------------------------------
+# Tuning phase 2: the cluster's shared minimum (config.MIN_INSTANCES_GRID)
+# ---------------------------------------------------------------------------
+def own_minimum(name: str, params: dict) -> int:
+    """Instances a detector needs after a reset before it can fire at all,
+    set by its own params (probe 2026-11-23: 0s then 1s right after
+    ensemble.reset_detector). HDDMWeighted has no explicit minimum."""
+    if name == "STEPD":
+        return 2 * int(params["window_size"])
+    if name == "SEED":
+        return 2 * int(params["block_size"])
+    if name == "RDDM":
+        return int(params["min_n_instances"])
+    return 0
+
+
+class GatedDetector:
+    """A detector whose fires are ignored until it has seen
+    ``min_instances`` instances since its last reset or its last accepted
+    fire (the cluster's shared minimum). The wrapped detector keeps
+    updating meanwhile; a fire it raises inside the gate is dropped (its
+    own self-reset still happens inside MOA). ``moa_detector`` is passed
+    through, so reset_detector and set_threshold work unchanged."""
+
+    def __init__(self, detector, min_instances: int):
+        self.detector = detector
+        self.min_instances = int(min_instances)
+        self.n_seen = 0  # instances since the last reset / accepted fire
+        self._fired = False
+
+    @property
+    def moa_detector(self):
+        return self.detector.moa_detector
+
+    def add_element(self, element: float) -> None:
+        self.detector.add_element(element)
+        self.n_seen += 1
+        self._fired = (self.detector.detected_change()
+                       and self.n_seen >= self.min_instances)
+        if self._fired:
+            self.n_seen = 0
+
+    def detected_change(self) -> bool:
+        return self._fired
+
+    def reset(self) -> None:
+        self.detector.reset()
+        self.n_seen = 0
+        self._fired = False
+
+
+def gate_alarms(alarms, errors, min_instances: int) -> list[int]:
+    """The alarms a GatedDetector would keep, computed from the ungated
+    alarms of a replay WITHOUT explicit resets (single detector on cached
+    errors). Exact there: the wrapped detector sees the same input either
+    way, so only the gate's bookkeeping differs. ``errors`` < 0 (warm-up)
+    are not fed to the detector and do not count."""
+    if min_instances <= 0:
+        return list(alarms)
+    fed = np.cumsum(np.asarray(errors) >= 0)  # instances fed up to t
+    kept: list[int] = []
+    last = 0
+    for t in alarms:
+        if fed[t] - last >= min_instances:
+            kept.append(int(t))
+            last = int(fed[t])
+    return kept
+
+
+def run_detector_on_errors(name: str, params: dict, errors,
+                           min_instances: int = 0) -> list[int]:
     """Feed a cached 0/1 error sequence (entries < 0 are the warm-up period
-    and are skipped) to a fresh detector; return the alarm indices."""
+    and are skipped) to a fresh detector; return the alarm indices. With
+    ``min_instances`` > 0 the detector is gated (GatedDetector)."""
     det = make_detector(name, params)
+    if min_instances > 0:
+        det = GatedDetector(det, min_instances)
     alarms: list[int] = []
     for t, e in enumerate(errors):
         if e < 0:

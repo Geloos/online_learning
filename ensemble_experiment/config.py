@@ -17,9 +17,12 @@ RESULTS_DIR = base.PROJECT_ROOT / "results" / "results_ensemble"  # run outcomes
 RUNS_DIR = RESULTS_DIR / "runs"
 # Statistics computed from the runs (analysis.py) live outside results/.
 ANALYSIS_DIR = base.PROJECT_ROOT / "statistics" / "ensemble_experiment"
-# Detector params tuned by the drift-ensemble experiment
-# (drift_ensemble/scripts/03_select_params.py).
+# Detector params tuned by the drift-ensemble experiment. Phase 1
+# (03_select_params.py) for the singles and ens_raw_resetall; phase 2
+# (03b_tune_min_instances.py: the cluster's shared minimum + re-tuned
+# params) for the two-vote methods (base.PHASE2_METHODS).
 SELECTED_PARAMS_PATH = base.TUNING_DIR / "selected_params.json"
+CLUSTER_PARAMS_PATH = base.CLUSTER_PARAMS_PATH
 
 # ---------------------------------------------------------------------------
 # Extended DDD (Minku & Yao 2011 + drift-type-aware adaptive cap + pool)
@@ -106,6 +109,60 @@ RECOVERY = {"level": 0.95, "min_instances": 50}
 STATS = {"method": "ens_raw_resetall", "acc_block": 200,
          "pre": 1000, "post": 5000}
 
+# ---------------------------------------------------------------------------
+# Real datasets (real.py, run_real.py): no known drift positions, so only
+# prequential accuracy and detection counts are reported. Same DDD config
+# as the synthetic runs; only the best method, ONE run (seed REAL_SEED, the
+# user's choice), plus a no-change baseline. The ARFF files come
+# from OpenML (capymoa.datasets can't be imported here because it needs
+# torchvision, and its Dropbox links are blocked on this network). OpenML
+# 151 is the normalized Electricity (MOA's elecNormNew), the same data as
+# capymoa's Electricity; md5 = OpenML's checksum (verified on download).
+# ---------------------------------------------------------------------------
+DATA_DIR = base.PROJECT_ROOT / "data"  # downloaded datasets (not in git)
+REAL_RUNS_DIR = RESULTS_DIR / "real"
+REAL_STATS_DIR = ANALYSIS_DIR / "real"
+REAL_METHODS = [STATS["method"]]  # ens_raw_resetall only (user's choice)
+REAL_SEED = SEEDS[0]  # one run per dataset: bagging seed 201
+REAL_DATASETS = {
+    "Electricity": {
+        "file": "electricity.arff",
+        "length": 45_312,
+        "url": "https://openml.org/data/v1/download/2419/electricity.arff",
+        "md5": "8ca97867d960ae029ae3a9ac2c923d34",
+        "acc_block": 500,  # plot: one point per this many instances
+    },
+    # OpenML 1169: MOA's airlines (Bifet & Ikonomovska), flight delayed y/n.
+    "Airlines": {
+        "file": "airlines.arff",
+        "length": 539_383,
+        "url": "https://openml.org/data/v1/download/66526/airlines.arff",
+        "md5": "2c1189a18602a2cfdfe952b7d262562b",
+        "acc_block": 5_000,
+    },
+    # OpenML 150: MOA's covtypeNorm (normalized, original order), 7 classes.
+    "Covtype": {
+        "file": "covtype.arff",
+        "length": 581_012,
+        "url": "https://openml.org/data/v1/download/2418/covertype.arff",
+        "md5": "9aed5f745bd2f9bea46e1622e9d5a5f3",
+        "acc_block": 5_000,
+    },
+    # OpenML 155: MOA's poker-lsn (Poker Hand), 10 classes, class last.
+    "Poker": {
+        "file": "pokerhand.arff",
+        "length": 829_201,
+        "url": "https://openml.org/data/v1/download/2423/pokerhand.arff",
+        "md5": "21773aa4931b1815ee7eaa7aaf4c7ac1",
+        "acc_block": 5_000,
+    },
+}
+# The large datasets (540k-830k instances) need more JVM heap than the
+# synthetic runs: main.py runs run_real.py with these JVM args and at most
+# REAL_MAX_WORKERS workers.
+REAL_JVM_ARGS = "-Xmx3g -Xss10M"
+REAL_MAX_WORKERS = 4
+
 
 def snapshot() -> dict:
     """The values that define a run, stored in each run's meta.json."""
@@ -119,6 +176,7 @@ def snapshot() -> dict:
         "DUPLICATES_AS_FP": DUPLICATES_AS_FP,
         "INIT_FUNCTION": streams.INIT_FUNCTION,
         "CLUSTER_MEMBERS": base.CLUSTER_MEMBERS,
+        "PHASE2_METHODS": base.PHASE2_METHODS,
         "DETECTOR_ORDER": base.DETECTOR_ORDER,
         "VOTE": base.VOTE,
         "SENS": base.SENS,

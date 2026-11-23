@@ -14,6 +14,13 @@ Every method runs on every test stream:
                  later voter of a pair becomes more sensitive (thresholds
                  are changed mid-stream, per cluster — see config.SENS)
 
+Every detector runs with its cluster's params. The singles and
+ens_raw_resetall use tuning phase 1 (selected_params.json, no shared
+minimum); the two-vote methods (config.PHASE2_METHODS) use phase 2
+(cluster_params.json), where each detector also sits behind its cluster's
+shared minimum (GatedDetector: no fire is accepted until M instances after
+a reset or an accepted fire). method_params picks the file per method.
+
 The HT error sequence is deterministic given the stream, so methods read it
 from the per-stream cache (tests/test_cache_replay.py proves equality with a
 live HT run).
@@ -26,6 +33,7 @@ import time
 from drift_ensemble import config
 from drift_ensemble.cache import load_cache
 from drift_ensemble.detectors import (
+    GatedDetector,
     make_detector,
     run_detector_on_errors,
     set_threshold,
@@ -45,16 +53,35 @@ CLUSTER_OF = {
 }
 
 
+def method_params(method: str, phase1: dict, phase2: dict) -> dict:
+    """The tuning a method runs with: phase 2 (cluster_params.json) for
+    the two-vote methods, phase 1 (selected_params.json) for the rest."""
+    return phase2 if method in config.PHASE2_METHODS else phase1
+
+
 def params_for(name: str, selected_params: dict) -> dict:
     """A detector always runs with the params tuned for its own cluster."""
     return selected_params[CLUSTER_OF[name]][name]
 
 
+def min_instances_for(name: str, selected_params: dict) -> int:
+    """The shared minimum of the detector's cluster (tuning phase 2,
+    cluster_params.json). 0 = no gate (a phase-1 selected_params dict)."""
+    return int(selected_params.get("min_instances", {})
+               .get(CLUSTER_OF[name], 0))
+
+
+def build_detector(name: str, selected_params: dict):
+    """One detector with its cluster's params, gated by its cluster's
+    shared minimum when there is one."""
+    det = make_detector(name, params_for(name, selected_params))
+    m = min_instances_for(name, selected_params)
+    return GatedDetector(det, m) if m > 0 else det
+
+
 def build_detectors(selected_params: dict) -> dict:
-    return {
-        name: make_detector(name, params_for(name, selected_params))
-        for name in config.DETECTOR_ORDER
-    }
+    return {name: build_detector(name, selected_params)
+            for name in config.DETECTOR_ORDER}
 
 
 def build_method_ensemble(method: str, selected_params: dict):
@@ -135,7 +162,8 @@ def run_method(method: str, generator: str, mode: str, seed: int,
     if method.startswith("single_"):
         name = method[len("single_"):]
         alarms = run_detector_on_errors(
-            name, params_for(name, selected_params), errors)
+            name, params_for(name, selected_params), errors,
+            min_instances_for(name, selected_params))
         result = {"alarms": alarms}
     elif method in ("ens_raw_resetall", "ens_cluster_vote",
                     "ens_cluster_sens"):

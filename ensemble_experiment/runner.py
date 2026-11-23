@@ -22,18 +22,18 @@ import numpy as np
 from ensemble_experiment import config
 from ensemble_experiment.bagging import EnsembleFactory
 from ensemble_experiment.ddd import ExtendedDDD
-from ensemble_experiment.detection import load_selected_params, make_signal
+from ensemble_experiment.detection import load_method_params, make_signal
 from ensemble_experiment.logger import EPISODE_FIELDS, STEP_FIELDS, RunLogger
 from streams import concept_ids, mark_recurring, plan_stream, stream_from_plan
 
-_SELECTED_PARAMS: dict | None = None
+_METHOD_PARAMS: dict[str, dict] = {}
 
 
-def _selected_params() -> dict:
-    global _SELECTED_PARAMS
-    if _SELECTED_PARAMS is None:
-        _SELECTED_PARAMS = load_selected_params()
-    return _SELECTED_PARAMS
+def _method_params(method: str) -> dict:
+    """Tuned params for ``method`` (phase 1 or 2), loaded once."""
+    if method not in _METHOD_PARAMS:
+        _METHOD_PARAMS[method] = load_method_params(method)
+    return _METHOD_PARAMS[method]
 
 
 def run_specs(generators=None, modes=None, seeds=None, methods=None):
@@ -95,7 +95,7 @@ def run_one(generator: str, mode: str, seed: int, method: str, *,
     if (out / "meta.json").exists() and not force:
         return out
     cfg = config.DDD if cfg is None else cfg
-    selected_params = (_selected_params() if selected_params is None
+    selected_params = (_method_params(method) if selected_params is None
                        else selected_params)
     min_training_size = (config.MIN_TRAINING_SIZE
                          if min_training_size is None else min_training_size)
@@ -152,6 +152,7 @@ def run_one(generator: str, mode: str, seed: int, method: str, *,
         "summary": {k: _clean(v) for k, v in summary.items()},
         "config": config.snapshot() if cfg is config.DDD else {
             **config.snapshot(), "DDD": cfg},
+        "detector_params": selected_params,  # incl. cluster minimums
         "overrides": overrides,
         "min_training_size": min_training_size,
         "runtime_s": time.perf_counter() - t0,

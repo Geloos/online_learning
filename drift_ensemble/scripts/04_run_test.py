@@ -20,12 +20,22 @@ def main() -> None:
     args = ap.parse_args()
 
     from drift_ensemble import config
-    from drift_ensemble.runio import is_run_done, load_selected_params
+    from drift_ensemble.runio import (
+        is_run_done,
+        load_cluster_params,
+        load_selected_params,
+    )
     from drift_ensemble.runio import run_and_save
     from drift_ensemble.config import test_stream_specs
     from streams import stream_id
 
-    load_selected_params()  # fail fast with a clear message if 02/03 not run
+    load_selected_params()  # fail fast if phase 1 (02/03) not run
+    params = load_cluster_params()  # ... or phase 2 (03b)
+    print(f"Phase-1 params (singles, ens_raw_resetall): "
+          f"{config.TUNING_DIR / 'selected_params.json'}")
+    print(f"Phase-2 params ({', '.join(config.PHASE2_METHODS)}): "
+          f"{config.CLUSTER_PARAMS_PATH}, min_instances = "
+          f"{params['min_instances']}")
 
     specs = test_stream_specs()
     print(f"Cache dir: {config.CACHE_DIR}")

@@ -32,8 +32,11 @@ Always use the venv's Python from the repo root:
 .venv\Scripts\python.exe -m pytest drift_ensemble/tests/test_cluster_vote.py::test_name
 ```
 
-`main.py` runs `drift_ensemble/scripts/01..05`, then `ensemble_experiment/run_experiment.py`
-and `analyze.py`. It runs each step as a subprocess and stops at the first failure.
+`main.py` runs `drift_ensemble/scripts/01, 02, 03, 03b, 04, 05`, then
+`ensemble_experiment/run_experiment.py`, `analyze.py` and `run_real.py` (9 steps). It runs
+each step as a subprocess and stops at the first failure.
+- The real-data step runs with `CAPYMOA_JVM_ARGS="-Xmx3g -Xss10M"` and at most 4 workers
+  (`config.REAL_JVM_ARGS`, `REAL_MAX_WORKERS`); main.py sets that for this step only.
 - Every step is resumable: finished work is skipped.
 - Long steps time one unit, print an estimate and wait for confirmation. `--yes` skips the
   prompt; it is required when running non-interactively.
@@ -51,7 +54,7 @@ justify `CLUSTER_MEMBERS` in `drift_ensemble/config.py`. Since 2026-11-20 (re-tu
   detector scores higher on GRADUAL.
 - The old 1000-window split, its tuning files and its runs were deleted on 2026-11-23 at the
   user's request. Don't bring them back up.
-- `main.py` prints a reminder after step 3 but does not stop.
+- `main.py` prints a reminder after step 3 but does not stop. Phase 2 (03b) keeps this split.
 
 ## Critical: import order and sys.path
 
@@ -91,8 +94,31 @@ There are 60 test streams: 3 generators × {ABRUPT, GRADUAL, MIXED, RECURRING} �
   `ground_truth.json` under `cache/`. HT's error sequence is deterministic given the stream,
   so **everything downstream replays these cached errors**. `tests/test_cache_replay.py`
   proves equivalence with a live run.
-- **Tuning:** `detectors.py` (factory, grids, `set_threshold`) → `tuning.py` (grid × cached
-  errors) → `selection.py` (best config per detector × mode, plus a LOGO check).
+- **Tuning phase 1:** `detectors.py` (factory, grids, `set_threshold`) → `tuning.py` (grid ×
+  cached errors) → `selection.py` (best config per detector × mode, plus a LOGO check) →
+  `selected_params.json`. The singles and `ens_raw_resetall` run with it (both experiments),
+  as do screening and the cluster-split check.
+- **Tuning phase 2** (`min_instances.py`, `scripts/03b_tune_min_instances.py`, added
+  2026-11-23 at the user's request): one shared minimum M per cluster, so a cluster's two
+  detectors switch back on together after every reset. The user wanted M_A and M_G tuned
+  separately; they're equal only if tuning says so.
+  - Own minimums (probe, 0s then 1s after a reset): STEPD 2 × window_size, SEED
+    2 × block_size, RDDM min_n_instances, HDDMWeighted none. With the phase-1 params they
+    ranged from ~230 (HDDM_W) to 2,000 (RDDM, STEPD) and caused the mismatch.
+  - `detectors.GatedDetector`: a fire counts only once the detector has seen M instances
+    since its last reset or accepted fire. It keeps learning meanwhile. RDDM's
+    min_n_instances is set to M. STEPD/SEED may only use configs with own minimum ≤ M.
+  - For each M in `MIN_INSTANCES_GRID` (50–2000), the cluster's members are re-tuned on the
+    cluster's own mode's tuning streams (phase-1 grids). The score is the mean of the two
+    members' best F1, and the best M wins. Singles never get an explicit reset, so gated alarms
+    come from one ungated replay (`gate_alarms`, tested equal to a gated run).
+  - Output: `phase2_runs.csv`, `phase2_summary.csv` and `cluster_params.json`
+    (`{"min_instances": {cluster: M}, cluster: {detector: params}}`).
+  - **Only the two-vote methods use phase 2** (`config.PHASE2_METHODS`: `ens_cluster_vote`,
+    `ens_cluster_sens`; the user's choice). The singles and `ens_raw_resetall` use phase 1
+    with no minimum. This holds in both experiments, so the real data (`ens_raw_resetall`)
+    uses phase 1. `workflow.method_params` picks the file, and `build_detector` gates when the
+    dict has `min_instances`. `meta.json` stores the params used.
 - **`ensemble.py`:** `RawResetAllEnsemble`, `ClusterVoteEnsemble` and
   `ClusterSensitivityEnsemble`. `workflow.run_method` runs the 7 roster methods
   (`config.METHODS`), the same 7 as experiment 2:
@@ -114,19 +140,30 @@ There are 60 test streams: 3 generators × {ABRUPT, GRADUAL, MIXED, RECURRING} �
 - **Statistics:** `stats.py` is called by `05_analyze.py` after `analysis.py`. It covers all 7
   methods and writes to `statistics/drift_ensemble/`:
   - `runs.csv` and `delays.csv`, which has one row per detected drift;
-  - `metrics.csv`: per method × mode, the medians over runs of precision, recall and F1,
-    and the median delay over the detected drifts;
-  - `delay_curve.csv`, plus `<MODE>/delay_curve.png`: medians when every run is rescored
+  - `metrics.csv`: per method × mode, the **mean and std** over runs of precision, recall
+    and F1 (`*_mean`, `*_std`), and the **median** delay over the detected drifts
+    (`delay_median`). The user chose this on 2026-11-23. The 15 runs are 3 generators ×
+    5 seeds, so a median hides a failure on a whole generator (GRADUAL HDDMWeighted: F1
+    0.16 on SEA, median ranked it 1st, mean 5th). Delays are skewed, so they use the
+    median.
+  - `delay_curve.csv`, plus `<MODE>/delay_curve.png`: means when every run is rescored
     for each max delay in `STATS["delay_grid"]` (0–500, step 25). The plot shows recall
     only (user's choice). The max delay counts from the drift END, so gradual curves start
-    above 0 at max delay 0: alarms during the 2,000-instance transition count.
+    above 0 at max delay 0: alarms during the 2,000-instance transition count. The user
+    confirmed this is correct.
   - one folder per mode with `singles.png` (the 4 detectors) and `ensembles.png` (the 3
-    ensembles). They are bar charts of the `metrics.csv` medians: per method, precision,
-    recall and F1 bars in the top row (0–1), and the delay bar in the bottom row (in
-    instances, since it's a different unit). Both charts of a mode share the delay scale.
-  - It is a separate module from the old `analysis/` tables (significance, diversity,
-    weights), which stay in `results/`. The file is named `stats.py` rather than
-    `statistics.py` so it doesn't shadow the stdlib module.
+    ensembles). They are bar charts of `metrics.csv`: per method, mean precision, recall
+    and F1 bars with std error bars in the top row (0–1), and the median delay bar in the
+    bottom row (in instances, since it's a different unit). Both charts of a mode share
+    the delay scale.
+  - `analysis/{tables,plots}` from `analysis.py`: detection_metrics (mean ± std, FAR,
+    LaTeX), per_run_metrics, per_type_mixed, first_to_fire, diversity, significance,
+    sensitivity_summary, runtime, plus weight, sensitivity and tuning-heatmap plots. Since
+    2026-11-23 they're in `statistics/`, like experiment 2, because `results/` holds only
+    run outcomes (cache, tuning, test runs, screening rows). analysis.py's own delay curves
+    and `detection_medians.csv` were dropped because they duplicated `stats.py`.
+  - The file is named `stats.py` rather than `statistics.py` so it doesn't shadow the
+    stdlib module.
 - **Detector screening:** `screening.py` and `scripts/screen_detectors.py` were added on
   2026-11-20 and are not part of `main.py`. They tune DDM, HDDMAverage and ADWIN
   (`config.SCREENING_GRIDS`, our own ranges) as single detectors on the cached errors, then
@@ -154,7 +191,8 @@ The full grid is 840 runs; each takes about 17 s. Results go under
 - **`bagging.py`:** online bagging that drives the Java `moa_learner` of capymoa
   HoeffdingTrees (NB-adaptive leaves).
 - **`ddd.py`:** the state machine. Ensembles and signal are injected, so the tests use fakes.
-- **`detection.py`:** wraps experiment 1's methods as signals.
+- **`detection.py`:** wraps experiment 1's methods as signals, with the same params as
+  experiment 1 (phase 1 or phase 2 per method, `load_method_params`).
 - **`logger.py`:** matches DDD's behaviour against the ground truth: TP/FP, pool concept tags
   and recall hits.
 - **`analysis.py`:** reads run folders only (`correct.npy` holds every instance, so no
@@ -175,6 +213,23 @@ The full grid is 840 runs; each takes about 17 s. Results go under
     ≥ 95% of the before accuracy. It's only checked after 50 instances.
 - **Live runs:** runs are live. No error cache is possible because DDD's errors depend on its
   own alarms.
+- **Real data (`real.py`, `run_real.py`, added 2026-11-23; main.py's last step since the same
+  day):** extended DDD on Electricity, Airlines, Covtype and Poker (`config.REAL_DATASETS`).
+  Run Airlines, Covtype and Poker with `CAPYMOA_JVM_ARGS="-Xmx3g -Xss10M"`, since they're
+  540k–830k instances.
+  - The user's choices: only `ens_raw_resetall`, ONE run (seed 201, `REAL_SEED`), no
+    more seeds.
+  - There are no drift positions, so only prequential accuracy (after warm-up), the
+    number of detections and accuracy over time are reported.
+  - A `no_change` baseline (predict the previous label) is included because Electricity
+    is strongly autocorrelated.
+  - The data comes from OpenML: 151 Electricity (= MOA's elecNormNew, same as capymoa's),
+    1169 Airlines (MOA's), 150 Covtype (MOA's covtypeNorm, original order) and 155 Poker
+    (MOA's poker-lsn, 829,201 instances, 10 classes). It's md5-checked and stored in
+    `data/` (gitignored). `capymoa.datasets` can't be imported (it
+    needs torchvision), and its Dropbox links are blocked on this network.
+  - Runs go to `results/results_ensemble/real/`, statistics to
+    `statistics/ensemble_experiment/real/<dataset>/`.
 - **Choices beyond the user's spec:**
   - The signal is reset on every detection, and on any exit whose winner isn't new-low.
   - Recall may pick the entry frozen at the same detection; this is tracked as

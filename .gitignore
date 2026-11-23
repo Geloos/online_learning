@@ -9,7 +9,10 @@ __pycache__/
 # (the tuned detector params) is needed to run either experiment.
 results/results_drift_ensemble/cache/
 results/results_drift_ensemble/test/
-results/results_drift_ensemble/analysis/
+results/results_drift_ensemble/screening/
 
 # Outputs of the extended-DDD experiment.
 results/results_ensemble/
+
+# Downloaded real datasets (ensemble_experiment/real.py).
+data/

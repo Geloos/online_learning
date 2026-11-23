@@ -8,16 +8,24 @@ Reads ONLY the run folders under results/results_drift_ensemble/test/
                             precision, recall, F1, mean delay
   delays.csv                one row per detected real drift: its delay
   metrics.csv               one row per method x mode: summed TP/FP/FN,
-                            median precision / recall / F1 over the mode's
-                            runs, median delay over its detected drifts
-  delay_curve.csv           median precision / recall / F1 over runs for
+                            mean and std of precision / recall / F1 over
+                            the mode's runs, median delay over its
+                            detected drifts
+  delay_curve.csv           mean precision / recall / F1 over runs for
                             every max delay in STATS["delay_grid"]
-  <MODE>/singles.png        bar chart of the metrics.csv medians: per single
-                            detector a precision, recall and F1 bar (top
-                            row, 0-1) and its delay bar (bottom row, in
-                            instances, same delay scale for both charts)
+  <MODE>/singles.png        bar chart of metrics.csv: per single detector
+                            the mean precision, recall and F1 with std
+                            error bars (top row, 0-1) and its median delay
+                            (bottom row, in instances, same delay scale
+                            for both charts)
   <MODE>/ensembles.png      the same for the four ensemble methods
   <MODE>/delay_curve.png    the delay curves, one line per method
+
+Why mean for P/R/F1 but median for delay: the 15 runs of a method x mode
+are 3 generators x 5 seeds, so a method that fails on one whole generator
+fails on a third of the runs, and a median would hide that. P/R/F1 are
+bounded in [0, 1], so a mean is safe. Delays are skewed with a long tail,
+so they use the median.
 
 Scoring is evaluation.match_alarms with config.MAX_DELAY: drift k is
 detected by the first alarm in [start_k, end_k + max delay], delay = alarm -
@@ -119,8 +127,9 @@ def delay_table(runs) -> pd.DataFrame:
 
 def method_summary(run_df: pd.DataFrame, delay_df: pd.DataFrame
                    ) -> pd.DataFrame:
-    """One row per method x mode: summed TP/FP/FN, median precision /
-    recall / F1 over the runs, median delay over the detected drifts."""
+    """One row per method x mode: summed TP/FP/FN, mean and std of
+    precision / recall / F1 over the runs, median delay over the detected
+    drifts (see the module docstring for why)."""
     rows = []
     for mode in config.MODES:
         for method in config.METHODS:
@@ -129,18 +138,20 @@ def method_summary(run_df: pd.DataFrame, delay_df: pd.DataFrame
                 continue
             d = delay_df[(delay_df["mode"] == mode)
                          & (delay_df["method"] == method)]
-            rows.append({
-                "mode": mode, "method": method, "n_runs": len(x),
-                "tp": int(x["tp"].sum()), "fp": int(x["fp"].sum()),
-                "fn": int(x["fn"].sum()),
-                **{k: x[k].median() for k in METRICS},
-                "delay": d["delay"].median() if len(d) else np.nan,
-            })
+            row = {"mode": mode, "method": method, "n_runs": len(x),
+                   "tp": int(x["tp"].sum()), "fp": int(x["fp"].sum()),
+                   "fn": int(x["fn"].sum())}
+            for k in METRICS:
+                row[f"{k}_mean"] = x[k].mean()
+                row[f"{k}_std"] = x[k].std(ddof=1) if len(x) > 1 else 0.0
+            row["n_detected"] = len(d)
+            row["delay_median"] = d["delay"].median() if len(d) else np.nan
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
 def delay_curve_table(runs, grid=None) -> pd.DataFrame:
-    """Median precision / recall / F1 over runs per method x mode x max
+    """Mean precision / recall / F1 over runs per method x mode x max
     delay (every run rescored with each max delay of ``grid``)."""
     grid = config.STATS["delay_grid"] if grid is None else grid
     rows = []
@@ -151,7 +162,7 @@ def delay_curve_table(runs, grid=None) -> pd.DataFrame:
             rows.append({**_keys(r), **p})
     df = pd.DataFrame(rows)
     out = (df.groupby(["mode", "method", "max_delay"])
-           .agg(n_runs=("f1", "size"), **{k: (k, "median") for k in METRICS})
+           .agg(n_runs=("f1", "size"), **{k: (k, "mean") for k in METRICS})
            .reset_index())
     return _ordered(out, ["mode", "method", "max_delay"])
 
@@ -188,7 +199,7 @@ def plot_delay_curves(curve: pd.DataFrame, out_dir) -> list[str]:
                     marker="o", ms=3, label=_label(method))
         ax.set_xlabel("max delay after the drift end (instances)",
                       fontsize=9, color=MUTED)
-        ax.set_ylabel("recall (median over runs)", fontsize=9, color=MUTED)
+        ax.set_ylabel("recall (mean over runs)", fontsize=9, color=MUTED)
         ax.set_ylim(-0.02, 1.02)
         ax.set_xticks(range(0, int(sub["max_delay"].max()) + 1, 100))
         _style(ax)
@@ -196,7 +207,7 @@ def plot_delay_curves(curve: pd.DataFrame, out_dir) -> list[str]:
                   frameon=False)
         n = int(sub["n_runs"].max())
         fig.suptitle(f"{mode}: recall against the allowed delay "
-                     f"(median over {n} runs per method)",
+                     f"(mean over {n} runs per method)",
                      fontsize=12, color=INK)
         fig.tight_layout()
         out = out_dir / mode / "delay_curve.png"
@@ -222,22 +233,27 @@ def _bar_chart(rows: pd.DataFrame, title: str, delay_top: float,
         2, 1, figsize=(10, 7), sharex=True,
         gridspec_kw={"height_ratios": [2.2, 1]})
     for i, metric in enumerate(METRICS):
-        v = rows[metric].to_numpy(dtype=float)
+        v = rows[f"{metric}_mean"].to_numpy(dtype=float)
+        s = np.nan_to_num(rows[f"{metric}_std"].to_numpy(dtype=float))
+        # error bars clipped to [0, 1], the range of the metric
+        lo, hi = np.minimum(s, v), np.minimum(s, 1.0 - v)
         pos = x + (i - 1) * w
         top.bar(pos, v, w, color=METRIC_COLORS[metric],
                 edgecolor="white", lw=1.5, label=METRIC_NAMES[metric])
-        for p, val in zip(pos, v):
+        top.errorbar(pos, v, yerr=[lo, hi], fmt="none", ecolor=MUTED,
+                     elinewidth=1, capsize=3)
+        for p, val, h in zip(pos, v, hi):
             if not np.isnan(val):
-                top.text(p, val + 0.015, f"{val:.2f}", ha="center",
+                top.text(p, val + h + 0.015, f"{val:.2f}", ha="center",
                          va="bottom", fontsize=7.5, color=MUTED)
-    top.set_ylim(0, 1.1)
+    top.set_ylim(0, 1.12)
     top.set_yticks(np.linspace(0, 1, 6))
-    top.set_ylabel("median over runs", fontsize=9, color=MUTED)
+    top.set_ylabel("mean over runs (± std)", fontsize=9, color=MUTED)
     top.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0), fontsize=9,
                frameon=False)
     _style(top)
 
-    d = rows["delay"].to_numpy(dtype=float)
+    d = rows["delay_median"].to_numpy(dtype=float)
     bot.bar(x, np.nan_to_num(d), w, color=METRIC_COLORS["delay"],
             edgecolor="white", lw=1.5)
     for p, val in zip(x, d):
@@ -262,14 +278,14 @@ def _bar_chart(rows: pd.DataFrame, title: str, delay_top: float,
 
 
 def plot_bars(summary: pd.DataFrame, out_dir) -> list[str]:
-    """<MODE>/singles.png and <MODE>/ensembles.png from the metrics.csv
-    medians. Both charts of a mode share the delay scale."""
+    """<MODE>/singles.png and <MODE>/ensembles.png from metrics.csv. Both
+    charts of a mode share the delay scale."""
     files = []
     for mode in config.MODES:
         sub = summary[summary["mode"] == mode]
         if sub.empty:
             continue
-        top = sub["delay"].max()
+        top = sub["delay_median"].max()
         top = 100.0 if np.isnan(top) else max(100.0, np.ceil(top / 100) * 100)
         delay_top = top * 1.2
         (out_dir / mode).mkdir(parents=True, exist_ok=True)
@@ -281,8 +297,8 @@ def plot_bars(summary: pd.DataFrame, out_dir) -> list[str]:
             kind = ("single detectors" if group == "singles"
                     else "ensembles")
             out = out_dir / mode / f"{group}.png"
-            _bar_chart(rows, f"{mode}: {kind} (median over {n} runs per "
-                             f"method, max delay {config.MAX_DELAY})",
+            _bar_chart(rows, f"{mode}: {kind} ({n} runs per method, "
+                             f"max delay {config.MAX_DELAY})",
                        delay_top, out)
             files.append(f"{mode}/{out.name}")
     return files

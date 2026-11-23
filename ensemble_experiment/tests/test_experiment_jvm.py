@@ -10,6 +10,19 @@ from ensemble_experiment import config  # noqa: F401  (JAVA_HOME first)
 pytestmark = pytest.mark.jvm
 
 
+def _cluster_params(m=200):
+    """A fixed cluster_params.json-style dict (capymoa defaults, shared
+    minimum m), so these tests don't depend on a tuning run."""
+    from drift_ensemble import config as base
+
+    out = {"min_instances": {c: m for c in base.CLUSTER_MEMBERS}}
+    for c, members in base.CLUSTER_MEMBERS.items():
+        out[c] = {n: dict(base.DEFAULT_PARAMS[n]) for n in members}
+        if "RDDM" in out[c]:
+            out[c]["RDDM"]["min_n_instances"] = m
+    return out
+
+
 def _instances(n=600, seed=201):
     from streams import make_stream
 
@@ -68,12 +81,23 @@ def test_ensemble_predicts_after_learning_and_is_reproducible():
     assert run() == preds
 
 
+def _phase1_params():
+    """A fixed selected_params.json-style dict (no shared minimum)."""
+    p = _cluster_params()
+    del p["min_instances"]
+    return p
+
+
+# (not ens_raw_resetall: STEPD with capymoa's default params fires every
+# 60 instances on an all-zero error stream, a MOA STEPD edge case)
 @pytest.mark.parametrize("method", ["single_HDDMWeighted",
                                     "ens_cluster_sens"])
 def test_signal_fires_and_resets(method):
-    from ensemble_experiment.detection import load_selected_params, make_signal
+    from drift_ensemble.workflow import method_params
+    from ensemble_experiment.detection import make_signal
 
-    sig = make_signal(method, load_selected_params())
+    sig = make_signal(method, method_params(method, _phase1_params(),
+                                            _cluster_params()))
     errs = [0] * 3000 + [1] * 1000
     fired = [t for t, e in enumerate(errs) if sig.update(t, e)]
     assert fired, "no alarm on a 0 -> 1 error jump"
@@ -87,6 +111,7 @@ def test_smoke_run_writes_all_files(tmp_path):
     from ensemble_experiment.runner import run_one
 
     out = run_one("Agrawal", "RECURRING", 201, "ens_cluster_sens",
+                  selected_params=_cluster_params(),
                   overrides={"n_drifts": 2, "drift_every_n": 1000,
                              "gradual_width": 200},
                   out_root=tmp_path, min_training_size=300, log_every=50)
@@ -98,6 +123,7 @@ def test_smoke_run_writes_all_files(tmp_path):
     assert 0.0 <= s["acc"] <= 1.0
     assert meta["length"] == 3200
     assert len(np.load(out / "correct.npy")) == 3200
+    assert meta["detector_params"] == _cluster_params()
     # re-run is skipped (resumable)
     mtime = (out / "meta.json").stat().st_mtime
     run_one("Agrawal", "RECURRING", 201, "ens_cluster_sens",

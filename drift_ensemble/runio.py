@@ -13,7 +13,7 @@ import json
 
 from drift_ensemble import config
 from streams import stream_id
-from drift_ensemble.workflow import run_method
+from drift_ensemble.workflow import method_params, run_method
 
 WEIGHT_FIELDS = ["t", "detector", "w"]
 SENS_FIELDS = ["t", "detector", "level", "threshold", "reason"]
@@ -73,6 +73,7 @@ def save_run(generator: str, mode: str, seed: int, method: str,
 
 
 def load_selected_params() -> dict:
+    """Phase-1 params (both modes, every detector; used by screening)."""
     path = config.TUNING_DIR / "selected_params.json"
     if not path.exists():
         raise FileNotFoundError(
@@ -81,19 +82,31 @@ def load_selected_params() -> dict:
     return json.loads(path.read_text())
 
 
+def load_cluster_params(path=None) -> dict:
+    """Phase-2 params: each cluster's shared minimum and its members'
+    params (used by config.PHASE2_METHODS, the two-vote ensembles)."""
+    path = config.CLUSTER_PARAMS_PATH if path is None else path
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found — run drift_ensemble/scripts/"
+            f"03b_tune_min_instances.py (tuning phase 2) first")
+    return json.loads(path.read_text())
+
+
 # ---------------------------------------------------------------------------
 # Pool worker (module-level so it pickles under spawn)
 # ---------------------------------------------------------------------------
-_SELECTED: dict | None = None
+_PHASES: tuple[dict, dict] | None = None  # (phase 1, phase 2)
 
 
 def run_and_save(task: tuple[str, str, int, str]) -> tuple[str, str, float]:
     """Run one (generator, mode, seed, method) unit and persist it.
     Returns (sid, method, runtime_s). Safe to call in pool workers."""
-    global _SELECTED
-    if _SELECTED is None:
-        _SELECTED = load_selected_params()
+    global _PHASES
+    if _PHASES is None:
+        _PHASES = (load_selected_params(), load_cluster_params())
     generator, mode, seed, method = task
-    result = run_method(method, generator, mode, seed, _SELECTED)
-    save_run(generator, mode, seed, method, result, _SELECTED)
+    params = method_params(method, *_PHASES)
+    result = run_method(method, generator, mode, seed, params)
+    save_run(generator, mode, seed, method, result, params)
     return stream_id(generator, mode, seed), method, result["runtime_s"]

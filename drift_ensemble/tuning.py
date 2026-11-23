@@ -39,6 +39,25 @@ def all_tasks() -> list[tuple[str, str]]:
     ]
 
 
+def score_alarms(alarms, sid: str, ground_truth: list[dict],
+                 length: int) -> dict:
+    """Stream id fields + every tuning metric of one alarm list."""
+    metrics = compute_metrics(
+        alarms, ground_truth, config.MAX_DELAY, length,
+        config.MIN_TRAINING_SIZE, config.DUPLICATES_AS_FP,
+    )
+    dc = delay_curve(alarms, ground_truth, config.DELAY_GRID,
+                     config.DUPLICATES_AS_FP)
+    generator, mode, seed = sid.split(",")
+    return {
+        "generator": generator,
+        "mode": mode,
+        "seed": int(seed),
+        **metrics,
+        "delay_auc": dc["delay_auc"],
+    }
+
+
 def evaluate_config_on_stream(
     detector: str,
     params: dict,
@@ -48,21 +67,10 @@ def evaluate_config_on_stream(
     length: int,
 ) -> dict:
     alarms = run_detector_on_errors(detector, params, errors)
-    metrics = compute_metrics(
-        alarms, ground_truth, config.MAX_DELAY, length,
-        config.MIN_TRAINING_SIZE, config.DUPLICATES_AS_FP,
-    )
-    dc = delay_curve(alarms, ground_truth, config.DELAY_GRID,
-                     config.DUPLICATES_AS_FP)
-    generator, mode, seed = sid.split(",")
     return {
         "detector": detector,
         "params": params_key(params),
-        "generator": generator,
-        "mode": mode,
-        "seed": int(seed),
-        **metrics,
-        "delay_auc": dc["delay_auc"],
+        **score_alarms(alarms, sid, ground_truth, length),
     }
 
 

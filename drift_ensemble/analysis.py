@@ -1,7 +1,8 @@
 """Analysis of finished test runs (drift_ensemble/scripts/05_analyze.py).
 
 Reads ONLY result folders (never reruns experiments) and writes the tables
-and plots under results/results_drift_ensemble/analysis/. Scoring parameters
+and plots under statistics/drift_ensemble/analysis/ (results/ holds only run
+outcomes). The main medians and delay curves are stats.py's. Scoring parameters
 (max delay, delay grid, duplicates-as-FP) are analysis-time choices taken
 from the current config — alarms do not depend on them; only warm-up comes
 from each run's snapshot, so shrunken smoke runs analyze correctly too.
@@ -22,7 +23,6 @@ matplotlib.use("Agg", force=True)  # headless plotting for plotnine
 from drift_ensemble import config
 from drift_ensemble.evaluation import (
     compute_metrics,
-    delay_curve,
     match_alarms,
     per_type,
 )
@@ -170,43 +170,6 @@ def detection_metrics(metrics: pd.DataFrame
             for m, s in zip(agg[f"{c}_mean"], agg[f"{c}_std"].fillna(0.0))
         ]
     return agg, pretty
-
-
-def detection_medians(metrics: pd.DataFrame) -> pd.DataFrame:
-    """Compact median-only view: per method x mode (plus ALL), the median
-    over runs of precision, recall, F1, delay and FAR."""
-    agg, _ = detection_metrics(metrics)
-    out = agg[["method", "mode", "n_runs",
-               "precision_median", "recall_median", "f1_median",
-               "mean_delay_median", "far_median"]].copy()
-    return out.rename(columns={
-        "precision_median": "precision",
-        "recall_median": "recall",
-        "f1_median": "f1",
-        "mean_delay_median": "delay",
-        "far_median": "far",
-    })
-
-
-def delay_curve_table(runs) -> pd.DataFrame:
-    rows = []
-    for r in runs:
-        e = _eval_cfg(r)
-        dc = delay_curve(r["alarms"], r["meta"]["ground_truth"],
-                         e["delay_grid"], e["duplicates_as_fp"])
-        for p in dc["points"]:
-            rows.append({
-                "method": r["meta"]["method"],
-                "mode": r["meta"]["mode"],
-                "generator": r["meta"]["generator"],
-                "seed": r["meta"]["seed"],
-                **p,
-            })
-    df = pd.DataFrame(rows)
-    out = (df.groupby(["method", "mode", "max_delay"], observed=True)
-           [["recall", "f1"]].mean().reset_index())
-    out["method"] = _method_cat(out["method"])
-    return out.sort_values(["mode", "method", "max_delay"])
 
 
 def per_type_mixed(runs) -> pd.DataFrame:
@@ -375,26 +338,6 @@ def runtime(runs) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Plots (plotnine)
 # ---------------------------------------------------------------------------
-def plot_delay_curves(dc: pd.DataFrame) -> list[str]:
-    from plotnine import (aes, geom_line, geom_point, ggplot, labs,
-                          scale_x_continuous, theme_bw, ylim)
-
-    files = []
-    for mode in sorted(dc["mode"].unique()):
-        sub = dc[dc["mode"] == mode]
-        p = (ggplot(sub, aes("max_delay", "recall", color="method"))
-             + geom_line() + geom_point(size=1)
-             + scale_x_continuous(breaks=sorted(sub["max_delay"].unique()))
-             + ylim(0, 1)
-             + labs(title=f"Recall vs allowed delay — {mode}",
-                    x="max delay (instances)", y="recall")
-             + theme_bw())
-        out = plots_dir() / f"delay_curve_{mode}.png"
-        p.save(out, width=8, height=4.5, dpi=150, verbose=False)
-        files.append(out.name)
-    return files
-
-
 def plot_weights(runs) -> list[str]:
     from plotnine import (aes, geom_step, geom_vline, ggplot, labs,
                           theme_bw, ylim)
@@ -596,8 +539,6 @@ def analyze(make_plots: bool = True) -> dict:
     print(f"  run_index.csv  ({len(idx)} rows)")
 
     section("detection_metrics", detection, None)
-    section("detection_medians", detection_medians, metrics)
-    section("delay_curve", delay_curve_table, runs)
     section("per_type_mixed", per_type_mixed, runs)
     section("first_to_fire", first_to_fire, runs)
     section("diversity", diversity, runs)
@@ -607,7 +548,6 @@ def analyze(make_plots: bool = True) -> dict:
 
     if make_plots:
         for name, fn, args in [
-            ("delay_curve plots", plot_delay_curves, (out["delay_curve"],)),
             ("weight plots", plot_weights, (runs,)),
             ("sensitivity plots", plot_sensitivity, (runs,)),
             ("tuning heatmaps", plot_tuning_heatmaps, ()),

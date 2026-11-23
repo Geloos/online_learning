@@ -51,17 +51,31 @@ def test_delay_table_has_only_detected_drifts(runs):
         (1, "ABRUPT", 100), (1, "GRADUAL", 1000), (2, "ABRUPT", 300)]
 
 
-def test_method_summary_medians(runs):
+def test_method_summary_means_and_median_delay(runs):
     s = stats.method_summary(stats.run_table(runs), stats.delay_table(runs))
     assert len(s) == 1
     row = s.iloc[0]
     assert (row["mode"], row["method"], row["n_runs"]) == (
         "MIXED", "single_SEED", 2)
     assert (row["tp"], row["fp"], row["fn"]) == (3, 1, 1)
-    assert row["precision"] == pytest.approx((2 / 3 + 1) / 2)
-    assert row["recall"] == pytest.approx(0.75)
-    assert row["f1"] == pytest.approx((0.8 + 2 / 3) / 2)
-    assert row["delay"] == 300  # median over the 3 detected drifts
+    assert row["precision_mean"] == pytest.approx((2 / 3 + 1) / 2)
+    assert row["recall_mean"] == pytest.approx(0.75)
+    assert row["f1_mean"] == pytest.approx((0.8 + 2 / 3) / 2)
+    # sample std of two values a, b is |a - b| / sqrt(2)
+    assert row["recall_std"] == pytest.approx(0.5 / 2 ** 0.5)
+    assert row["n_detected"] == 3
+    assert row["delay_median"] == 300  # delays 100, 1000, 300
+
+
+def test_mean_differs_from_median_on_a_failed_generator(tmp_path):
+    # 3 runs, one failing (F1 0): the mean counts the failure, a median
+    # of [0, 0.8, 0.8] would not.
+    for seed, alarms in [(1, [2100, 6000, 9000]), (2, [2100, 6000, 9000]),
+                         (3, [])]:
+        _write_run(tmp_path, seed, alarms)
+    runs = load_runs(tmp_path)
+    s = stats.method_summary(stats.run_table(runs), stats.delay_table(runs))
+    assert s.iloc[0]["f1_mean"] == pytest.approx(1.6 / 3)
 
 
 def test_delay_curve_zero_and_full_window(runs):
@@ -74,7 +88,7 @@ def test_delay_curve_zero_and_full_window(runs):
     runs_df = stats.run_table(runs)
     for metric in stats.METRICS:
         assert at.loc[config.MAX_DELAY, metric] == pytest.approx(
-            runs_df[metric].median())
+            runs_df[metric].mean())
 
 
 def test_run_statistics_writes_every_file(tmp_path):

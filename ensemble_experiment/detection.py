@@ -2,9 +2,10 @@
 
 A signal exposes ``update(t, err) -> bool`` (True = drift alarm at t),
 ``reset()`` and the logs ``alarms``, ``raw_fires`` and ``logs``. The
-detectors run with the params tuned for their cluster
-(results/results_drift_ensemble/tuning/selected_params.json), exactly as
-in the detector study.
+detectors run with the params tuned for their cluster, exactly as in the
+detector study: tuning phase 1 (selected_params.json) for the singles and
+ens_raw_resetall, phase 2 (cluster_params.json: re-tuned params behind the
+cluster's shared minimum) for the two-vote methods.
 
 reset() wipes every detector's statistics (and pending cluster votes) but
 keeps what an ensemble has learned about its detectors: cluster_vote
@@ -18,19 +19,27 @@ import json
 from ensemble_experiment import config
 from drift_ensemble.ensemble import reset_detector
 from drift_ensemble.workflow import (
+    build_detector,
     build_method_ensemble,
-    make_detector,
-    params_for,
+    method_params,
 )
 
 
-def load_selected_params(path=None) -> dict:
-    path = config.SELECTED_PARAMS_PATH if path is None else path
+def _load(path, script: str) -> dict:
     if not path.exists():
         raise FileNotFoundError(
             f"{path} not found — run the drift-ensemble experiment's "
-            f"drift_ensemble/scripts/03_select_params.py first")
+            f"drift_ensemble/scripts/{script} first")
     return json.loads(path.read_text())
+
+
+def load_method_params(method: str) -> dict:
+    """The tuned params ``method`` runs with: phase 2 for the two-vote
+    methods, phase 1 for the singles and ens_raw_resetall."""
+    return method_params(
+        method,
+        _load(config.SELECTED_PARAMS_PATH, "03_select_params.py"),
+        _load(config.CLUSTER_PARAMS_PATH, "03b_tune_min_instances.py"))
 
 
 class SingleSignal:
@@ -97,6 +106,5 @@ def make_signal(method: str, selected_params: dict):
         raise ValueError(f"unknown detection method: {method!r}")
     if method.startswith("single_"):
         name = method[len("single_"):]
-        return SingleSignal(name, make_detector(
-            name, params_for(name, selected_params)))
+        return SingleSignal(name, build_detector(name, selected_params))
     return EnsembleSignal(build_method_ensemble(method, selected_params))

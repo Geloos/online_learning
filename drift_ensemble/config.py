@@ -23,10 +23,12 @@ RESULTS_DIR = PROJECT_ROOT / "results" / "results_drift_ensemble"
 CACHE_DIR = RESULTS_DIR / "cache"
 TUNING_DIR = RESULTS_DIR / "tuning"
 TEST_DIR = RESULTS_DIR / "test"
-ANALYSIS_DIR = RESULTS_DIR / "analysis"
-# Statistics (statistics.py-style medians, delay curves, histograms) live
-# outside results/, which holds only run outcomes.
+# results/ holds only run outcomes (cache, tuning, test runs, screening
+# rows). Everything computed from them lives under statistics/: stats.py's
+# medians, delay curves and bar charts at the top, analysis.py's tables
+# (significance, diversity, ...) and plots in analysis/.
 STATISTICS_DIR = PROJECT_ROOT / "statistics" / "drift_ensemble"
+ANALYSIS_DIR = STATISTICS_DIR / "analysis"
 
 # ---------------------------------------------------------------------------
 # Streams (built by the shared streams.py)
@@ -134,6 +136,36 @@ DEFAULT_PARAMS = {
     "HDDMAverage": {"drift_confidence": 0.001, "test_type": "Two-sided"},
     "ADWIN": {"delta": 0.002},
 }
+
+# ---------------------------------------------------------------------------
+# Tuning phase 2: a shared minimum per cluster
+# (drift_ensemble/min_instances.py, scripts/03b_tune_min_instances.py).
+#
+# Each detector has its own minimum number of instances after a reset
+# before it can fire (measured by probe on 2026-11-23, 0s then 1s right
+# after a reset): STEPD 2 x window_size, SEED 2 x block_size, RDDM
+# min_n_instances, HDDMWeighted none (a statistical test only). With the
+# phase-1 params the two detectors of a cluster therefore switched back on
+# at different times after every alarm (e.g. RDDM 2000 vs HDDMWeighted
+# ~230).
+#
+# Phase 2 gives each cluster ONE minimum M (M_A for ABRUPT, M_G for
+# GRADUAL, tuned separately; equal only if tuning says so):
+#   - a gate: after a reset (stream start, reset-all) or after an accepted
+#     fire, a detector's fires are ignored until it has seen M instances.
+#     The detector keeps updating its statistics meanwhile.
+#   - RDDM's min_n_instances is set to M; STEPD and SEED may only use
+#     configs whose own minimum is <= M (so the gate decides when they
+#     start, not their params). HDDMWeighted can use every config.
+# For each M in the grid, the cluster's two detectors are re-tuned on the
+# cluster's own mode (ABRUPT or GRADUAL tuning streams, phase-1 grids).
+# The cluster's score at M is the mean of its two detectors' best mean
+# TUNE_OBJECTIVE; the M with the highest score wins. Output:
+# tuning/cluster_params.json, used by the two-vote methods only
+# (PHASE2_METHODS: ens_cluster_vote, ens_cluster_sens) in both experiments.
+# ---------------------------------------------------------------------------
+MIN_INSTANCES_GRID = [50, 100, 200, 300, 500, 1000, 2000]
+CLUSTER_PARAMS_PATH = TUNING_DIR / "cluster_params.json"
 
 # ---------------------------------------------------------------------------
 # Detector screening (drift_ensemble/scripts/screen_detectors.py): extra
@@ -263,6 +295,13 @@ METHODS = [
     "ens_cluster_vote",
     "ens_cluster_sens",
 ]
+# Which tuning each method runs with (user's choice, 2026-11-23): the two
+# methods that need two votes from a cluster use tuning phase 2
+# (cluster_params.json: the cluster's shared minimum + its re-tuned
+# params). The singles and ens_raw_resetall use phase 1
+# (selected_params.json: each detector tuned alone, its cluster's mode
+# params, no shared minimum), in both experiments.
+PHASE2_METHODS = ["ens_cluster_vote", "ens_cluster_sens"]
 
 def snapshot() -> dict:
     """The config values that define an experiment, for meta.json files."""
@@ -281,6 +320,8 @@ def snapshot() -> dict:
         "TUNE_OBJECTIVE": TUNE_OBJECTIVE,
         "SEED_RANDOM_CONFIGS": SEED_RANDOM_CONFIGS,
         "GRID_SAMPLE_SEED": GRID_SAMPLE_SEED,
+        "MIN_INSTANCES_GRID": MIN_INSTANCES_GRID,
+        "PHASE2_METHODS": PHASE2_METHODS,
         "CLUSTER_MEMBERS": CLUSTER_MEMBERS,
         "DETECTOR_ORDER": DETECTOR_ORDER,
         "VOTE": VOTE,
