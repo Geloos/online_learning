@@ -38,7 +38,7 @@ Always use the venv's Python from the repo root:
 `screen` exists too but isn't part of the full run. Without a step, main.py runs the 9 in
 order, each as a subprocess, and stops at the first failure.
 - **Layout:** restructured on 2026-11-23 at the user's request, because they found it
-  overengineered. It went from 66 to 24 `.py` files: no `scripts/` folders, one module per
+  overengineered. It went from 66 to 23 `.py` files: no `scripts/` folders, one module per
   topic, one test file per module. Don't split it back into many small files.
   `main.run_pool` is the one time-one-unit → confirm → worker-pool loop that every step uses.
 - The `real` step sets `CAPYMOA_JVM_ARGS="-Xmx3g -Xss10M"` itself and uses at most 4 workers
@@ -103,8 +103,8 @@ Modules:
 - `tuning.py`: phase 1, phase 2 and screening.
 - `runs.py`: HT error cache, which params a method uses, one method on one stream, and run
   folders (save + `load_runs`).
-- `stats.py`: scoring (`match_alarms`, `compute_metrics`, `delay_curve`) and the statistics.
-- `analysis.py`: tables and plots.
+- `stats.py`: scoring (`match_alarms`, `compute_metrics`, `delay_curve`) and every
+  statistic: tables, plots, significance tests, tuning heatmaps.
 
 - **Cache (`runs.py`, step `cache`; `test` caches the test streams):** runs one HT pass per
   stream and stores `errors.npy`, `ht_accuracy.npy` and `ground_truth.json` under `cache/`.
@@ -150,13 +150,14 @@ Modules:
     mid-stream via `detectors.set_threshold`.
   - `runs.build_method_ensemble` builds the three ensemble classes. Experiment 2 reuses it.
 - **Outputs:** `runs.py` defines the run-folder format (alarms.json, weights.csv,
-  sensitivity.csv, raw_fires.csv, meta.json). `analysis.py` and `stats.py` read *only*
-  result folders and must never recompute from streams.
-- **Statistics:** `stats.py` is called by the `stats` step after `analysis.py`. It covers all 7
-  methods and writes to `statistics/drift_ensemble/`:
-  - `runs.csv` and `delays.csv`, which has one row per detected drift;
-  - `metrics.csv`: per method × mode, the **mean and std** over runs of precision, recall
-    and F1 (`*_mean`, `*_std`), and the **median** delay over the detected drifts
+  sensitivity.csv, raw_fires.csv, meta.json). `stats.py` reads *only* result folders and
+  must never recompute from streams.
+- **Statistics:** `stats.py` (step `stats`) covers all 7 methods and writes to
+  `statistics/drift_ensemble/`:
+  - `runs.csv` (one row per run, including `far` and the duplicate alarms `n_dup`) and
+    `delays.csv` (one row per detected drift);
+  - `metrics.csv`: per method × mode, the **mean and std** over runs of precision, recall,
+    F1 and far (`*_mean`, `*_std`), summed TP/FP/FN/n_dup, and the **median** delay over the detected drifts
     (`delay_median`). The user chose this on 2026-11-23. The 15 runs are 3 generators ×
     5 seeds, so a median hides a failure on a whole generator (GRADUAL HDDMWeighted: F1
     0.16 on SEA, median ranked it 1st, mean 5th). Delays are skewed, so they use the
@@ -171,12 +172,18 @@ Modules:
     and F1 bars with std error bars in the top row (0–1), and the median delay bar in the
     bottom row (in instances, since it's a different unit). Both charts of a mode share
     the delay scale.
-  - `analysis/{tables,plots}` from `analysis.py`: detection_metrics (mean ± std, FAR,
-    LaTeX), per_run_metrics, per_type_mixed, first_to_fire, diversity, significance,
-    sensitivity_summary, runtime, plus weight, sensitivity and tuning-heatmap plots. Since
-    2026-11-23 they're in `statistics/`, like experiment 2, because `results/` holds only
-    run outcomes (cache, tuning, test runs, screening rows). analysis.py's own delay curves
-    and `detection_medians.csv` were dropped because they duplicated `stats.py`.
+  - `significance.csv` (Wilcoxon on F1: each ensemble vs each single, each cluster ensemble
+    vs the other ensembles), `per_type_mixed.csv` (abrupt vs gradual drifts in MIXED and
+    RECURRING), `first_to_fire.csv`, `diversity.csv` (Q-statistic and disagreement),
+    `sensitivity_summary.csv` (ens_cluster_sens levels), `runtime.csv`, and
+    `tuning_heatmaps/<detector>_<mode>.png` (phase-1 tuning F1).
+  - These came from the old `analysis.py`, which was merged into `stats.py` on 2026-11-23
+    at the user's request. The merged tables were verified identical to the old ones.
+    - Dropped as duplicates: `detection_metrics` (same as `metrics.csv`, with a LaTeX
+      copy), `per_run_metrics` (= `runs.csv`) and `run_index`. Their extra `far` and
+      `n_dup` columns moved into `runs.csv` and `metrics.csv`.
+    - Also dropped: the 120 per-run weight and sensitivity plots. Don't bring any of these
+      back.
   - The file is named `stats.py` rather than `statistics.py` so it doesn't shadow the
     stdlib module.
 - **Detector screening** (`tuning.py`, step `screen`, added 2026-11-20, not part of the

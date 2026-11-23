@@ -58,7 +58,7 @@ You can also run one step at a time: `python main.py STEP [--workers N] [--yes] 
 | 3 | `select` | tuning phase 1: best config per detector × mode | `--objective` |
 | 4 | `phase2` | tuning phase 2: each cluster's shared minimum | |
 | 5 | `test` | run the 7 methods on the 60 test streams | `--methods` |
-| 6 | `stats` | statistics of experiment 1 | `--no-plots` |
+| 6 | `stats` | statistics of experiment 1 | |
 | 7 | `ddd` | extended DDD on the synthetic streams | `--generators`, `--modes`, `--seeds`, `--methods` |
 | 8 | `ddd-stats` | statistics of the DDD runs | |
 | 9 | `real` | DDD on the real datasets, and their statistics | `--datasets`, `--methods` |
@@ -112,9 +112,13 @@ classification function. The seed fixes the whole stream.
 - **Scoring:** an alarm is a true positive if it falls in `[drift start, drift end + 500]`.
   The metrics are precision, recall, F1, delay and false-alarm rate, with Wilcoxon tests on F1.
   `statistics/drift_ensemble/` holds, for every method × mode:
-  - mean ± std of precision, recall and F1 over the runs, and the median delay;
+  - mean ± std of precision, recall, F1 and false-alarm rate over the runs, and the
+    median delay;
   - recall as the allowed delay shrinks from 500 to 0;
-  - bar charts per mode (singles and ensembles).
+  - bar charts per mode (singles and ensembles);
+  - Wilcoxon tests on F1, recall on abrupt vs gradual drifts in MIXED and RECURRING,
+    which detector fires first, how much the detectors agree, the sensitivity levels of
+    `ens_cluster_sens`, run times, and heatmaps of the tuning F1.
 
 **Experiment 2: extended DDD.**
 - **Streams:** 3 generators × 4 modes × 10 seeds, with 8 drifts per stream, one every 5,000
@@ -150,8 +154,8 @@ drift_ensemble/        experiment 1
                        reset-all / cluster-vote / cluster-sens ensembles
   tuning.py            tuning phase 1 and 2, detector screening
   runs.py              tree-error cache, one method on one test stream, result folders
-  stats.py             alarm <-> drift scoring, per-method statistics
-  analysis.py          tables and plots (reads result folders only)
+  stats.py             alarm <-> drift scoring, every statistic (reads result folders
+                       only)
   tests/               test_detectors, test_tuning, test_runs, test_stats
 ensemble_experiment/   experiment 2
   config.py            every setting of the experiment
@@ -165,8 +169,10 @@ results/
   results_ensemble/         runs/<generator>,<mode>,<seed>,<method>/  real/
 statistics/
   drift_ensemble/           runs.csv  delays.csv  metrics.csv  delay_curve.csv
+                            significance.csv  per_type_mixed.csv  first_to_fire.csv
+                            diversity.csv  sensitivity_summary.csv  runtime.csv
                             screening.csv  <MODE>/{singles,ensembles,delay_curve}.png
-                            analysis/{tables,plots}
+                            tuning_heatmaps/
   ensemble_experiment/      recovery.csv  drifts.csv  accuracy_200_<MODE>.png
                             real/<dataset>/{accuracy.csv,accuracy_over_time.png}
 ```

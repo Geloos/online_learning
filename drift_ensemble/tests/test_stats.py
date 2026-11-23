@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 
+import pandas as pd
 import pytest
 
 from drift_ensemble import config, stats
@@ -205,7 +206,73 @@ def test_delay_curve_zero_and_full_window(runs):
             runs_df[metric].mean())
 
 
-def test_run_statistics_writes_every_file(tmp_path):
+def test_run_table_counts_duplicates_and_false_alarm_rate(tmp_path):
+    _write_run(tmp_path, 1, [2100, 2200, 9000])
+    row = stats.run_table(load_runs(tmp_path)).iloc[0]
+    assert row["n_dup"] == 1  # 2200 repeats the drift found at 2100
+    assert row["fp"] == 2  # the duplicate and 9000
+    assert row["far"] == pytest.approx(2 / 9)  # per 1000 after warm-up
+
+
+def test_per_type_mixed_splits_abrupt_and_gradual(runs):
+    df = stats.per_type_mixed(runs).set_index("drift_type")
+    assert df.loc["ABRUPT", "recall"] == 1.0  # both seeds found it
+    assert df.loc["GRADUAL", "recall"] == 0.5  # only seed 1
+
+
+def test_first_to_fire_and_diversity(tmp_path):
+    _write_run(tmp_path, 1, [2100, 6000], method="single_SEED")
+    _write_run(tmp_path, 1, [2050], method="single_STEPD")
+    runs = load_runs(tmp_path)
+    first = stats.first_to_fire(runs).set_index("drift_type")
+    assert first.loc["ABRUPT", "detector"] == "STEPD"  # 2050 < 2100
+    assert first.loc["GRADUAL", "detector"] == "SEED"  # STEPD missed it
+    div = stats.diversity(runs).iloc[0]
+    assert (div["detector_a"], div["detector_b"]) == ("STEPD", "SEED")
+    assert (div["n11"], div["n01"], div["n10"], div["n00"]) == (1, 1, 0, 0)
+    assert div["disagreement"] == 0.5
+
+
+def test_significance_pairs_each_ensemble_with_each_single(tmp_path):
+    for seed in range(1, 7):  # the ensemble wins on every pair
+        _write_run(tmp_path, seed, [2100, 6000], method="ens_raw_resetall")
+        _write_run(tmp_path, seed, [2100, 6000, 9000])
+    sig = stats.significance(stats.run_table(load_runs(tmp_path)))
+    row = sig.set_index("comparison").loc["ens_raw_resetall_vs_single_SEED"]
+    assert row["n_pairs"] == 6
+    assert row["mean_diff"] == pytest.approx(1.0 - 0.8)
+    assert row["p_value"] < 0.05
+
+
+def test_sensitivity_summary_and_runtime(tmp_path):
+    _write_run(tmp_path, 1, [2100], method="ens_cluster_sens")
+    meta_path = tmp_path / "SEA,MIXED,1,ens_cluster_sens" / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["final_levels"] = {"SEED": 2.0}
+    meta_path.write_text(json.dumps(meta))
+    runs = load_runs(tmp_path)
+    s = stats.sensitivity_summary(runs).set_index("detector")
+    assert s.loc["SEED", "mean_final_level"] == 2.0
+    assert s.loc["RDDM", "mean_final_level"] == 0.0
+    rt = stats.runtime(runs).iloc[0]
+    assert (rt["method"], rt["n_runs"]) == ("ens_cluster_sens", 1)
+
+
+def test_tuning_heatmaps(tmp_path):
+    rows = [{"detector": "RDDM", "mode": "ABRUPT", "generator": "SEA",
+             "seed": 1, "f1": 0.5,
+             "params": json.dumps({"min_n_instances": n,
+                                   "drift_level": lvl})}
+            for n in (100, 500) for lvl in (1.5, 2.0)]
+    csv = tmp_path / "tuning_runs.csv"
+    pd.DataFrame(rows).to_csv(csv, index=False)
+    files = stats.plot_tuning_heatmaps(tmp_path / "out", csv)
+    assert files == ["RDDM_ABRUPT.png"]
+    assert (tmp_path / "out" / "RDDM_ABRUPT.png").exists()
+
+
+def test_run_statistics_writes_every_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TUNING_DIR", tmp_path / "no_tuning")
     test_dir, out = tmp_path / "test", tmp_path / "out"
     for seed, alarms in [(1, [2100, 6000, 9000]), (2, [2300])]:
         _write_run(test_dir, seed, alarms)
@@ -215,8 +282,11 @@ def test_run_statistics_writes_every_file(tmp_path):
     assert len(summary) == 2
     names = {p.relative_to(out).as_posix() for p in out.rglob("*")
              if p.is_file()}
-    assert {"runs.csv", "delays.csv", "metrics.csv",
-            "delay_curve.csv"} <= names
+    assert {"runs.csv", "delays.csv", "metrics.csv", "delay_curve.csv",
+            "significance.csv", "per_type_mixed.csv", "first_to_fire.csv",
+            "diversity.csv", "sensitivity_summary.csv",
+            "runtime.csv"} <= names
+    assert {"n_dup", "far_mean", "far_std"} <= set(summary.columns)
     # ABRUPT has only an ensemble run, MIXED only a single-detector run
     assert {"ABRUPT/delay_curve.png", "ABRUPT/ensembles.png",
             "MIXED/delay_curve.png", "MIXED/singles.png"} <= names

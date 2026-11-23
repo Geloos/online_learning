@@ -70,11 +70,9 @@ CACHE_DIR = RESULTS_DIR / "cache"
 TUNING_DIR = RESULTS_DIR / "tuning"
 TEST_DIR = RESULTS_DIR / "test"
 # results/ holds only run outcomes (cache, tuning, test runs, screening
-# rows). Everything computed from them lives under statistics/: stats.py's
-# medians, delay curves and bar charts at the top, analysis.py's tables
-# (significance, diversity, ...) and plots in analysis/.
+# rows). Everything computed from them (stats.py: tables, bar charts, delay
+# curves, tuning heatmaps) lives under statistics/.
 STATISTICS_DIR = PROJECT_ROOT / "statistics" / "drift_ensemble"
-ANALYSIS_DIR = STATISTICS_DIR / "analysis"
 
 # ---------------------------------------------------------------------------
 # Streams (built by the shared streams.py)

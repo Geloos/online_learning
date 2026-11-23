@@ -4,11 +4,16 @@ every method.
   * scoring     matching alarms to drifts (TP / FP / FN, delays), metrics
                 and delay curves; used by tuning, the statistics and DDD
   * statistics  per method x mode: mean / std of P/R/F1, median delay,
-                delay curves and bar charts -> statistics/drift_ensemble/
+                delay curves and bar charts, plus significance tests,
+                per-drift-type recall, first-to-fire, detector diversity,
+                sensitivity levels, runtime and the tuning heatmaps
+                -> statistics/drift_ensemble/
 """
 
 from __future__ import annotations
 
+import itertools
+import json
 import math
 from bisect import bisect_right
 from dataclasses import dataclass, field
@@ -191,12 +196,15 @@ def per_type(
 # (never reruns streams) and writes to statistics/drift_ensemble/:
 #
 #   runs.csv                  one row per run (stream x method): TP, FP, FN,
-#                             precision, recall, F1, mean delay
+#                             precision, recall, F1, mean delay, false
+#                             alarms per 1000 instances (far), duplicate
+#                             alarms (n_dup: extra alarms on an already
+#                             detected drift, counted in fp)
 #   delays.csv                one row per detected real drift: its delay
-#   metrics.csv               one row per method x mode: summed TP/FP/FN,
-#                             mean and std of precision / recall / F1 over
-#                             the mode's runs, median delay over its
-#                             detected drifts
+#   metrics.csv               one row per method x mode: summed TP/FP/FN and
+#                             n_dup, mean and std of precision / recall / F1
+#                             and far over the mode's runs, median delay
+#                             over its detected drifts
 #   delay_curve.csv           mean precision / recall / F1 over runs for
 #                             every max delay in STATS["delay_grid"]
 #   <MODE>/singles.png        bar chart of metrics.csv: per single detector
@@ -204,8 +212,22 @@ def per_type(
 #                             error bars (top row, 0-1) and its median delay
 #                             (bottom row, in instances, same delay scale
 #                             for both charts)
-#   <MODE>/ensembles.png      the same for the four ensemble methods
+#   <MODE>/ensembles.png      the same for the ensemble methods
 #   <MODE>/delay_curve.png    the delay curves, one line per method
+#   significance.csv          Wilcoxon signed-rank on F1 per mode: each
+#                             ensemble vs each single, each cluster ensemble
+#                             vs every other ensemble
+#   per_type_mixed.csv        recall and mean delay on the abrupt vs the
+#                             gradual drifts of MIXED and RECURRING streams
+#   first_to_fire.csv         per true drift, which single detector fired
+#                             first inside its window
+#   diversity.csv             per detector pair: Q-statistic and
+#                             disagreement of their detected/missed drifts
+#   sensitivity_summary.csv   ens_cluster_sens: final sensitivity level per
+#                             detector, and how often it was nudged
+#   runtime.csv               mean and total run time per method
+#   tuning_heatmaps/          mean tuning F1 over two params per detector x
+#                             mode (tuning phase 1, tuning_runs.csv)
 #
 # Why mean for P/R/F1 but median for delay: the 15 runs of a method x mode
 # are 3 generators x 5 seeds, so a method that fails on one whole generator
@@ -259,16 +281,20 @@ def _ordered(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
 # Tables
 # ---------------------------------------------------------------------------
 def run_table(runs) -> pd.DataFrame:
-    """One row per run: TP/FP/FN, precision, recall, F1, mean delay."""
+    """One row per run: TP/FP/FN, precision, recall, F1, mean delay, false
+    alarm rate and duplicate alarms."""
     rows = []
     for r in runs:
         m = compute_metrics(
             r["alarms"], r["meta"]["ground_truth"], config.MAX_DELAY,
             r["meta"]["length"], r["meta"]["config"]["MIN_TRAINING_SIZE"],
             config.DUPLICATES_AS_FP)
+        # extra alarms inside an already-matched drift window
+        n_dup = len(match_alarms(r["alarms"], r["meta"]["ground_truth"],
+                                 config.MAX_DELAY).duplicate_alarms)
         rows.append({**_keys(r), **{k: m[k] for k in
                      ["tp", "fp", "fn", "precision", "recall", "f1",
-                      "mean_delay"]}})
+                      "mean_delay", "far"]}, "n_dup": n_dup})
     return _ordered(pd.DataFrame(rows), ["mode", "method", "generator",
                                          "seed"])
 
@@ -308,8 +334,8 @@ def method_summary(run_df: pd.DataFrame, delay_df: pd.DataFrame
                          & (delay_df["method"] == method)]
             row = {"mode": mode, "method": method, "n_runs": len(x),
                    "tp": int(x["tp"].sum()), "fp": int(x["fp"].sum()),
-                   "fn": int(x["fn"].sum())}
-            for k in METRICS:
+                   "fn": int(x["fn"].sum()), "n_dup": int(x["n_dup"].sum())}
+            for k in METRICS + ["far"]:
                 row[f"{k}_mean"] = x[k].mean()
                 row[f"{k}_std"] = x[k].std(ddof=1) if len(x) > 1 else 0.0
             row["n_detected"] = len(d)
@@ -333,6 +359,185 @@ def delay_curve_table(runs, grid=None) -> pd.DataFrame:
            .agg(n_runs=("f1", "size"), **{k: (k, "mean") for k in METRICS})
            .reset_index())
     return _ordered(out, ["mode", "method", "max_delay"])
+
+
+# ---------------------------------------------------------------------------
+# More tables: significance, drift types, detectors, sensitivity, runtime
+# ---------------------------------------------------------------------------
+SINGLES, ENSEMBLES = GROUPS["singles"], GROUPS["ensembles"]
+CLUSTER_METHODS = [m for m in ENSEMBLES
+                   if m in ("ens_cluster_vote", "ens_cluster_sens")]
+MIXED_MODES = ("MIXED", "RECURRING")  # abrupt and gradual drifts together
+
+
+def significance(run_df: pd.DataFrame) -> pd.DataFrame:
+    """Wilcoxon signed-rank on F1 over the (generator, seed) pairs, per
+    mode: each ensemble vs each single detector, plus each cluster ensemble
+    vs every other ensemble (each pair once)."""
+    from scipy.stats import wilcoxon
+
+    comparisons = [(e, s) for e in ENSEMBLES for s in SINGLES]
+    for a in CLUSTER_METHODS:
+        for b in ENSEMBLES:
+            if b != a and (b, a) not in comparisons:
+                comparisons.append((a, b))
+    rows = []
+    for mode in config.MODES:
+        sub = run_df[run_df["mode"] == mode]
+        if sub.empty:
+            continue
+        pivot = sub.pivot_table(index=["generator", "seed"],
+                                columns="method", values="f1")
+        for a, b in comparisons:
+            if a not in pivot or b not in pivot:
+                continue
+            paired = pivot[[a, b]].dropna()
+            x, y = paired[a], paired[b]
+            try:
+                stat, p = wilcoxon(x, y)
+            except ValueError:  # all differences are zero
+                stat, p = math.nan, math.nan
+            rows.append({"mode": mode, "comparison": f"{a}_vs_{b}",
+                         "n_pairs": len(paired),
+                         "mean_f1_a": float(x.mean()),
+                         "mean_f1_b": float(y.mean()),
+                         "mean_diff": float((x - y).mean()),
+                         "wilcoxon_stat": stat, "p_value": p})
+    return pd.DataFrame(rows)
+
+
+def per_type_mixed(runs) -> pd.DataFrame:
+    """Recall and mean delay per drift type on the streams that mix abrupt
+    and gradual drifts (MIXED, RECURRING)."""
+    rows = []
+    for r in runs:
+        if r["meta"]["mode"] not in MIXED_MODES:
+            continue
+        pt = per_type(r["alarms"], r["meta"]["ground_truth"],
+                      config.MAX_DELAY, config.DUPLICATES_AS_FP)
+        for dtype, vals in pt.items():
+            rows.append({**_keys(r), "drift_type": dtype, **vals})
+    if not rows:
+        return pd.DataFrame()
+    out = (pd.DataFrame(rows)
+           .groupby(["mode", "method", "drift_type"], observed=True)
+           .agg(n_runs=("recall", "size"), recall=("recall", "mean"),
+                mean_delay=("mean_delay", "mean")).reset_index())
+    return _ordered(out, ["mode", "drift_type", "method"])
+
+
+def _single_alarms(runs) -> dict[str, dict]:
+    """sid -> {"meta": ..., "alarms": {detector: alarms}} from the single
+    detector runs."""
+    by_sid: dict[str, dict] = {}
+    for r in runs:
+        if r["meta"]["method"] in SINGLES:
+            entry = by_sid.setdefault(r["meta"]["sid"],
+                                      {"meta": r["meta"], "alarms": {}})
+            entry["alarms"][_label(r["meta"]["method"])] = r["alarms"]
+    return by_sid
+
+
+def first_to_fire(runs) -> pd.DataFrame:
+    """For each true drift: which single detector fired first inside its
+    window."""
+    cluster_of = {name: cl for cl, ms in config.CLUSTER_MEMBERS.items()
+                  for name in ms}
+    counts: dict[tuple, int] = {}
+    for entry in _single_alarms(runs).values():
+        meta = entry["meta"]
+        gt = sorted(meta["ground_truth"], key=lambda d: d["start"])
+        firsts = {name: match_alarms(alarms, gt, config.MAX_DELAY).matched
+                  for name, alarms in entry["alarms"].items()}
+        for k, drift in enumerate(gt):
+            best_name, best_t = "none", None
+            for name in config.DETECTOR_ORDER:
+                t = firsts.get(name, [None] * len(gt))[k]
+                if t is not None and (best_t is None or t < best_t):
+                    best_name, best_t = name, t
+            key = (meta["mode"], drift["type"], best_name)
+            counts[key] = counts.get(key, 0) + 1
+    df = pd.DataFrame([{"mode": mode, "drift_type": dtype, "detector": name,
+                        "cluster": cluster_of.get(name, "—"), "n_first": n}
+                       for (mode, dtype, name), n in sorted(counts.items())])
+    if df.empty:
+        return df
+    totals = df.groupby(["mode", "drift_type"])["n_first"].transform("sum")
+    df["share"] = df["n_first"] / totals
+    return df
+
+
+def diversity(runs) -> pd.DataFrame:
+    """Pairwise Q-statistic and disagreement between the 4 detectors over
+    the detected/missed vector of all true drifts (single runs)."""
+    by_mode: dict[str, dict[str, list[int]]] = {}
+    for entry in _single_alarms(runs).values():
+        meta = entry["meta"]
+        gt = sorted(meta["ground_truth"], key=lambda d: d["start"])
+        for name, alarms in entry["alarms"].items():
+            matched = match_alarms(alarms, gt, config.MAX_DELAY).matched
+            by_mode.setdefault(meta["mode"], {}).setdefault(name, []).extend(
+                int(m is not None) for m in matched)
+    rows = []
+    for mode, dets in sorted(by_mode.items()):
+        for a, b in itertools.combinations(config.DETECTOR_ORDER, 2):
+            if a not in dets or b not in dets:
+                continue
+            va, vb = np.array(dets[a]), np.array(dets[b])
+            n11 = int(((va == 1) & (vb == 1)).sum())
+            n00 = int(((va == 0) & (vb == 0)).sum())
+            n10 = int(((va == 1) & (vb == 0)).sum())
+            n01 = int(((va == 0) & (vb == 1)).sum())
+            denom = n11 * n00 + n01 * n10
+            rows.append({
+                "mode": mode, "detector_a": a, "detector_b": b,
+                "n11": n11, "n10": n10, "n01": n01, "n00": n00,
+                "q_statistic": ((n11 * n00 - n01 * n10) / denom
+                                if denom else math.nan),
+                "disagreement": ((n10 + n01) / len(va) if len(va)
+                                 else math.nan)})
+    return pd.DataFrame(rows)
+
+
+def sensitivity_summary(runs) -> pd.DataFrame:
+    """ens_cluster_sens: final sensitivity level per detector, averaged per
+    mode, and how often each detector was nudged for confirming late."""
+    rows = []
+    for r in runs:
+        meta = r["meta"]
+        if meta["method"] != "ens_cluster_sens":
+            continue
+        path = r["dir"] / "sensitivity.csv"
+        log = pd.read_csv(path) if path.exists() else pd.DataFrame()
+        final = meta.get("final_levels") or {}
+        for det in config.DETECTOR_ORDER:
+            n_late = int((log["detector"] == det).sum()) if len(log) else 0
+            rows.append({"method": meta["method"], "mode": meta["mode"],
+                         "detector": det,
+                         "final_level": final.get(det, 0.0),
+                         "n_late": n_late})
+    if not rows:
+        return pd.DataFrame()
+    return (pd.DataFrame(rows).groupby(["method", "mode", "detector"])
+            .agg(n_runs=("final_level", "size"),
+                 mean_final_level=("final_level", "mean"),
+                 min_final_level=("final_level", "min"),
+                 max_final_level=("final_level", "max"),
+                 mean_n_late=("n_late", "mean"))
+            .reset_index())
+
+
+def runtime(runs) -> pd.DataFrame:
+    """Mean and total run time per method."""
+    df = pd.DataFrame([{"method": r["meta"]["method"],
+                        "runtime_s": r["meta"]["runtime_s"]} for r in runs])
+    out = (df.groupby("method")
+           .agg(n_runs=("runtime_s", "size"),
+                mean_runtime_s=("runtime_s", "mean"),
+                total_runtime_s=("runtime_s", "sum")).reset_index())
+    out["method"] = pd.Categorical(out["method"], categories=config.METHODS,
+                                   ordered=True)
+    return out.sort_values("method").reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +650,56 @@ def _bar_chart(rows: pd.DataFrame, title: str, delay_top: float,
     plt.close(fig)
 
 
+HEATMAP_PARAMS = {
+    "STEPD": ("window_size", "alpha_drift"),
+    "SEED": ("delta", "epsilon_prime"),
+    "HDDMWeighted": ("drift_confidence", "lambda_"),
+    "RDDM": ("min_n_instances", "drift_level"),
+}
+
+
+def plot_tuning_heatmaps(out_dir, tuning_csv=None) -> list[str]:
+    """<detector>_<mode>.png: mean tuning-phase-1 F1 over two of the
+    detector's params (averaged over the others and the streams)."""
+    from plotnine import (aes, geom_text, geom_tile, ggplot, labs,
+                          scale_fill_gradient, theme_bw)
+
+    path = config.TUNING_DIR / "tuning_runs.csv" if tuning_csv is None \
+        else tuning_csv
+    if not path.exists():
+        return []
+    df = pd.read_csv(path).drop_duplicates(
+        subset=["detector", "params", "generator", "mode", "seed"],
+        keep="last")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = []
+    for detector, (p1, p2) in HEATMAP_PARAMS.items():
+        sub = df[df["detector"] == detector]
+        if sub.empty:
+            continue
+        params = sub["params"].map(json.loads)
+        sub = sub.assign(_p1=[p[p1] for p in params],
+                         _p2=[p[p2] for p in params])
+        for mode in sorted(sub["mode"].unique()):
+            m = (sub[sub["mode"] == mode]
+                 .groupby(["_p1", "_p2"])["f1"].mean().reset_index())
+            m["label"] = m["f1"].map(lambda v: f"{v:.2f}")
+            for col in ("_p1", "_p2"):
+                m[col] = pd.Categorical(
+                    m[col].astype(str),
+                    categories=[str(v) for v in sorted(m[col].unique())])
+            p = (ggplot(m, aes("_p1", "_p2", fill="f1"))
+                 + geom_tile() + geom_text(aes(label="label"), size=7)
+                 + scale_fill_gradient(low="#f7fbff", high="#08519c",
+                                       limits=(0, 1))
+                 + labs(title=f"{detector} mean F1 — {mode}", x=p1, y=p2)
+                 + theme_bw())
+            out = out_dir / f"{detector}_{mode}.png"
+            p.save(out, width=7, height=5, dpi=150, verbose=False)
+            files.append(out.name)
+    return files
+
+
 def plot_bars(summary: pd.DataFrame, out_dir) -> list[str]:
     """<MODE>/singles.png and <MODE>/ensembles.png from metrics.csv. Both
     charts of a mode share the delay scale."""
@@ -490,8 +745,15 @@ def run_statistics(test_dir=None, out_dir=None) -> pd.DataFrame:
     summary = method_summary(run_df, delay_df)
     curve = delay_curve_table(runs)
     for name, df in [("runs", run_df), ("delays", delay_df),
-                     ("metrics", summary), ("delay_curve", curve)]:
+                     ("metrics", summary), ("delay_curve", curve),
+                     ("significance", significance(run_df)),
+                     ("per_type_mixed", per_type_mixed(runs)),
+                     ("first_to_fire", first_to_fire(runs)),
+                     ("diversity", diversity(runs)),
+                     ("sensitivity_summary", sensitivity_summary(runs)),
+                     ("runtime", runtime(runs))]:
         df.to_csv(out_dir / f"{name}.csv", index=False)
     plot_delay_curves(curve, out_dir)
     plot_bars(summary, out_dir)
+    plot_tuning_heatmaps(out_dir / "tuning_heatmaps")
     return summary

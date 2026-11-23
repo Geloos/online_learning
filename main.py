@@ -290,14 +290,9 @@ def step_test(args) -> None:
 
 def step_stats(args) -> None:
     from drift_ensemble import config
-    from drift_ensemble.analysis import analyze
     from drift_ensemble.stats import run_statistics
 
-    print(f"Analyzing runs under {config.TEST_DIR} ...")
-    analyze(make_plots=not args.no_plots)
-    print(f"\nTables: {config.ANALYSIS_DIR / 'tables'}")
-    if not args.no_plots:
-        print(f"Plots:  {config.ANALYSIS_DIR / 'plots'}")
+    print(f"Statistics of the runs under {config.TEST_DIR} ...")
     summary = run_statistics()
     if summary.empty:
         return
@@ -470,7 +465,6 @@ def build_parser() -> argparse.ArgumentParser:
                              choices=["f1", "f2", "delay_auc"],
                              help="default: config.TUNE_OBJECTIVE")
     p["test"].add_argument("--methods", nargs="+", choices=c1.METHODS)
-    p["stats"].add_argument("--no-plots", action="store_true")
     p["ddd"].add_argument("--generators", nargs="+", choices=c2.GENERATORS)
     p["ddd"].add_argument("--modes", nargs="+", choices=c2.MODES)
     p["ddd"].add_argument("--seeds", nargs="+", type=int)
