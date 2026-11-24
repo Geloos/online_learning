@@ -1,6 +1,6 @@
 """Detectors and ensembles: the ensembles' state machines (StubDetector
-fakes, no JVM), the full reset, mid-stream thresholds and the phase-2 gate
-(some with a JVM).
+fakes, no JVM), the full reset and mid-stream thresholds (some with a
+JVM), and KSWIN (no JVM).
 """
 
 from __future__ import annotations
@@ -12,9 +12,10 @@ from drift_ensemble import config
 from drift_ensemble.detectors import (
     ClusterSensitivityEnsemble,
     ClusterVoteEnsemble,
-    gate_alarms,
-    GatedDetector,
     get_threshold,
+    ks_critical_count,
+    ks_pvalue_equal_sizes,
+    KSWIN,
     make_detector,
     RawResetAllEnsemble,
     reset_detector,
@@ -440,101 +441,61 @@ def test_sensitive_to_strict_mid_stream(name):
 
 
 # ===========================================================================
-# The cluster's shared-minimum gate (tuning phase 2)
+# KSWIN (our own implementation, screening only; no JVM)
 # ===========================================================================
-def _replay(det, errors):
+def _kswin_alarms(det, xs):
     alarms = []
-    for t, e in enumerate(errors):
-        if e < 0:
-            continue
-        det.add_element(float(e))
+    for t, x in enumerate(xs):
+        det.add_element(float(x))
         if det.detected_change():
             alarms.append(t)
     return alarms
 
 
-# ---------------------------------------------------------------------------
-# GatedDetector / gate_alarms (no JVM)
-# ---------------------------------------------------------------------------
-def test_gate_drops_fires_before_the_minimum():
-    # call indices 0-based: the n-th instance fed is index n-1
-    det = GatedDetector(StubDetector(fire_at=[49, 99, 150, 260, 400]), 100)
-    fired = [i for i in range(500)
-             if (det.add_element(0.0), det.detected_change())[1]]
-    # 49: 50 seen < 100 -> dropped; 99: 100 seen -> kept (gate restarts);
-    # 150: 51 since -> dropped; 260: 161 -> kept; 400: 140 -> kept
-    assert fired == [99, 260, 400]
+@pytest.mark.parametrize("r,alpha", [(30, 0.005), (50, 0.0001), (100, 0.05)])
+def test_kswin_critical_count_matches_scipy(r, alpha):
+    from scipy.stats import ks_2samp
+
+    def p(d):
+        ones = np.zeros(r)
+        ones[:d] = 1
+        return ks_2samp(ones, np.zeros(r), method="exact").pvalue
+
+    d = ks_critical_count(r, alpha)
+    assert p(d) <= alpha < p(d - 1)
+    for k in range(2, r + 1):
+        assert ks_pvalue_equal_sizes(r, k) == pytest.approx(p(k), abs=1e-12)
+    assert d / r > 0.1  # the libraries' extra "statistic > 0.1" never binds
 
 
-def test_reset_restarts_the_gate():
-    stub = StubDetector(fire_at=[120, 150])
-    det = GatedDetector(stub, 100)
-    for _ in range(100):
-        det.add_element(0.0)
-    reset_detector(det)  # stub has no moa_detector: Python reset only
-    assert stub.reset_count == 1
-    fired = [i for i in range(100, 300)
-             if (det.add_element(0.0), det.detected_change())[1]]
-    assert fired == []  # 120 is 21 after the reset, 150 is 51 after
+def test_kswin_constant_input_never_fires():
+    for x in (0, 1):
+        assert _kswin_alarms(KSWIN(0.05, 100, 30), [x] * 5000) == []
 
 
-def test_gate_alarms_matches_a_gated_replay():
+def test_kswin_fires_when_the_newest_part_has_enough_ones():
+    det = KSWIN(alpha=0.005, window_size=100, stat_size=30)
+    # 0s, then 1s: the older part stays all 0s, so the sample is fixed and
+    # the fire comes exactly when the newest 30 hold d_crit 1s.
+    alarms = _kswin_alarms(det, [0] * 200 + [1] * 70)
+    assert alarms[0] == 200 + det.d_crit - 1
+    # after a fire only stat_size inputs are kept: no test for 70 inputs
+    assert all(a >= alarms[0] + 70 for a in alarms[1:])
+
+
+def test_kswin_is_deterministic_per_seed_and_reset_restarts_it():
     rng = np.random.default_rng(3)
-    errors = np.concatenate([np.full(1000, -1), rng.integers(0, 2, 5000)])
-    fire_at = sorted(rng.choice(5000, size=120, replace=False).tolist())
-    ungated = _replay(StubDetector(fire_at), errors)
-    for m in (0, 1, 37, 100, 500):
-        gated = _replay(GatedDetector(StubDetector(fire_at), m), errors) \
-            if m else ungated
-        assert gate_alarms(ungated, errors, m) == gated
+    xs = np.r_[rng.random(3000) < 0.2, rng.random(3000) < 0.4].astype(int)
+    a = _kswin_alarms(KSWIN(0.01, 300, 50, seed=7), xs)
+    det = KSWIN(0.01, 300, 50, seed=7)
+    _kswin_alarms(det, xs[:1234])
+    det.reset()
+    assert _kswin_alarms(det, xs) == a
+    assert a and any(3000 <= t < 3600 for t in a)  # the 20% -> 40% rise
 
 
-# ---------------------------------------------------------------------------
-# Selection (no JVM)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Real detectors (JVM)
-# ---------------------------------------------------------------------------
-@pytest.mark.jvm
-@pytest.mark.parametrize("name,params,m", [
-    ("STEPD", {"window_size": 50, "alpha_drift": 0.01}, 300),
-    ("SEED", {"delta": 0.1, "epsilon_prime": 0.01, "block_size": 32,
-              "alpha": 0.6}, 2500),
-    ("HDDMWeighted", {"drift_confidence": 0.01, "lambda_": 0.05,
-                      "test_type": "One-sided"}, 500),
-    # (in phase 2 RDDM's min_n_instances = M, so its gate never drops a
-    # fire; a smaller min_n here just exercises the gate)
-    ("RDDM", {"min_n_instances": 30, "drift_level": 1.75}, 1000),
-])
-def test_gate_alarms_equals_gated_run_of_a_real_detector(name, params, m):
-    from drift_ensemble.detectors import run_detector_on_errors
-
-    rng = np.random.default_rng(7)
-    rates = np.repeat([0.1, 0.4, 0.15, 0.5, 0.2], 2000)
-    errors = np.concatenate([np.full(500, -1),
-                             (rng.random(rates.size) < rates).astype(int)])
-    ungated = run_detector_on_errors(name, params, errors)
-    gated = run_detector_on_errors(name, params, errors, m)
-    assert len(gated) < len(ungated)  # the gate really drops some fires
-    assert gate_alarms(ungated, errors, m) == gated
-
-
-@pytest.mark.jvm
-def test_gated_detector_passes_moa_through():
-    from drift_ensemble.detectors import (
-        get_threshold,
-        make_detector,
-        set_threshold,
-    )
-
-    det = GatedDetector(make_detector("STEPD", {"window_size": 30,
-                                                "alpha_drift": 0.003}), 100)
-    set_threshold(det, "STEPD", 0.05)
-    assert get_threshold(det, "STEPD") == pytest.approx(0.05)
-    for _ in range(50):
-        det.add_element(1.0)
-    reset_detector(det)  # Python reset + MOA resetLearning, gate restarted
-    assert det.n_seen == 0
-    assert get_threshold(det, "STEPD") == pytest.approx(0.05)
+def test_kswin_rejects_bad_configs_and_inputs():
+    with pytest.raises(ValueError):
+        KSWIN(0.01, window_size=100, stat_size=51)
+    with pytest.raises(ValueError):
+        KSWIN().add_element(0.5)

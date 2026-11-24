@@ -22,12 +22,13 @@ from pathlib import Path
 
 import numpy as np
 
+from drift_ensemble.runs import methods as roster
 from drift_ensemble.stats import compute_metrics, match_alarms
 from ensemble_experiment import config
 from ensemble_experiment.ddd import ExtendedDDD, VOTERS
 from ensemble_experiment.models import (
     EnsembleFactory,
-    load_method_params,
+    load_params,
     make_signal,
 )
 from streams import concept_ids, mark_recurring, plan_stream, stream_from_plan
@@ -263,22 +264,24 @@ class RunLogger:
 #   meta.json     summary + config snapshot; written LAST — its presence
 #                 marks the run as complete (re-runs skip it).
 # ===========================================================================
-_METHOD_PARAMS: dict[str, dict] = {}
+_PARAMS: dict | None = None
 
 
-def _method_params(method: str) -> dict:
-    """Tuned params for ``method`` (phase 1 or 2), loaded once."""
-    if method not in _METHOD_PARAMS:
-        _METHOD_PARAMS[method] = load_method_params(method)
-    return _METHOD_PARAMS[method]
+def _params() -> dict:
+    """The tuned detector params, loaded once."""
+    global _PARAMS
+    if _PARAMS is None:
+        _PARAMS = load_params()
+    return _PARAMS
 
 
 def run_specs(generators=None, modes=None, seeds=None, methods=None):
-    """All (generator, mode, seed, method) runs, in a fixed order."""
+    """All (generator, mode, seed, method) runs, in a fixed order. The
+    default methods are the tuned roster (selected_params.json)."""
     generators = config.GENERATORS if generators is None else generators
     modes = config.MODES if modes is None else modes
     seeds = config.SEEDS if seeds is None else seeds
-    methods = config.METHODS if methods is None else methods
+    methods = roster(_params()) if methods is None else methods
     return [(g, m, s, meth) for g in generators for m in modes
             for s in seeds for meth in methods]
 
@@ -332,7 +335,7 @@ def run_one(generator: str, mode: str, seed: int, method: str, *,
     if (out / "meta.json").exists() and not force:
         return out
     cfg = config.DDD if cfg is None else cfg
-    selected_params = (_method_params(method) if selected_params is None
+    selected_params = (_params() if selected_params is None
                        else selected_params)
     min_training_size = (config.MIN_TRAINING_SIZE
                          if min_training_size is None else min_training_size)
@@ -435,10 +438,14 @@ def _md5(path: Path) -> str:
 
 
 def dataset_path(name: str) -> Path:
-    """Local ARFF of a real dataset; downloaded once and checked against
-    its md5 (a wrong file would silently change every result)."""
+    """Local ARFF of a real dataset, checked against its md5 (a wrong file
+    would silently change every result). The OpenML ones are downloaded
+    once; the USP ones are part of the repository (data/)."""
     spec = config.REAL_DATASETS[name]
     path = config.DATA_DIR / spec["file"]
+    if not path.exists() and "url" not in spec:
+        raise FileNotFoundError(f"{path} not found — it is committed in "
+                                f"data/ (git checkout data/)")
     if not path.exists():
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
         print(f"Downloading {name} ...", flush=True)
@@ -519,7 +526,7 @@ def real_run_one(dataset: str, seed: int, method: str, *, out_root=None,
 
     length = config.REAL_DATASETS[dataset]["length"]
     stream = load_stream(dataset)
-    params = _method_params(method)  # ens_raw_resetall -> phase 1
+    params = _params()
     signal = make_signal(method, params)
     factory = EnsembleFactory(stream.get_schema(), config.DDD, seed)
     # No ground truth: one dummy concept for the logger.

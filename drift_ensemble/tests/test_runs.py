@@ -96,12 +96,16 @@ def test_plan_overrides():
 def test_stream_sets():
     tuning = _tuning_specs()
     test = _test_specs()
-    assert len(tuning) == 18  # 3 generators x 2 modes x 3 seeds
-    assert len(test) == 60  # 3 x 2 x 5 + 3 x (MIXED, RECURRING) x 5
+    assert len(tuning) == 102  # 3 generators x 2 modes x 17 seeds
+    assert len(test) == 153  # 3 generators x 3 modes x 17 seeds
+    recurring = config.recurring_stream_specs()
+    assert len(recurring) == 51  # cached only
+    assert {m for _, m, _ in test} == set(config.MODES)
+    test = test + recurring
     tuning_seeds = {s for _, _, s in tuning}
     test_seeds = {s for _, _, s in test}
     assert not tuning_seeds & test_seeds
-    assert len({stream_id(*s) for s in tuning + test}) == 78
+    assert len({stream_id(*s) for s in tuning + test}) == 306
 
 
 # ---------------------------------------------------------------------------

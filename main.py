@@ -6,21 +6,21 @@
 Steps, in the order of a full run:
 
   drift_ensemble (experiment 1)
-    cache      cache the HT errors of the 18 tuning streams
-    tune       tuning phase 1: every grid config on the tuning streams
-    select     tuning phase 1: the best config per detector x mode
-    phase2     tuning phase 2: each cluster's shared minimum (used by the
-               two-vote methods)
-    test       cache the 60 test streams and run the 7 methods on them
+    cache      cache the HT errors of the 102 tuning streams
+    tune       tuning: every grid config on the tuning streams
+    select     tuning: the best config per detector x mode and the
+               clusters, both by TF2
+    test       cache the 204 test streams and run the 7 methods on the 153
+               ABRUPT / GRADUAL / MIXED ones (RECURRING: cached only)
     stats      statistics -> statistics/drift_ensemble/
   ensemble_experiment (experiment 2)
     ddd        extended DDD on the synthetic streams
     ddd-stats  statistics -> statistics/ensemble_experiment/
-    real       DDD on Electricity, Airlines, Covtype and Poker, and their
-               statistics (always with REAL_JVM_ARGS, at most
-               REAL_MAX_WORKERS workers)
+    real       DDD on the 11 real datasets in data/ (4 from OpenML, 7 from the
+               USP Data Stream Repository), and their statistics (always
+               with REAL_JVM_ARGS, at most REAL_MAX_WORKERS workers)
 
-  screen       (not part of the full run) DDM, HDDMAverage and ADWIN
+  screen       (not part of the full run) DDM, HDDMAverage, ADWIN and KSWIN
                screened against the study's 4
 
 A full run starts each step as its own process and stops at the first
@@ -187,96 +187,49 @@ def step_select(args) -> None:
     df = tuning.load_tuning_runs()
     print(f"{len(df)} tuning rows ({df['detector'].nunique()} detectors, "
           f"{df.groupby('detector')['params'].nunique().to_dict()} configs)")
-    selected, summary = tuning.select_params(df, args.objective)
+    selected, summary = tuning.select_params(df)
+    clusters, summary = tuning.select_clusters(summary)
+    selected["clusters"] = clusters
     out_json = config.TUNING_DIR / "selected_params.json"
     out_json.write_text(json.dumps(selected, indent=2))
     summary.to_csv(config.TUNING_DIR / "tuning_summary.csv", index=False)
-    tuning.logo_check(df, args.objective).to_csv(
+    tuning.logo_check(df).to_csv(
         config.TUNING_DIR / "logo_check.csv", index=False)
 
-    cluster_of = {name: cl for cl, ms in config.CLUSTER_MEMBERS.items()
-                  for name in ms}
-    summary.insert(1, "cluster", summary["detector"].map(cluster_of))
-    _show(summary[["detector", "cluster", "mode", "mean_f1", "mean_recall",
-                   "mean_precision", "mean_mean_delay", "mean_far"]])
+    _show(summary[["mode", "rank", "detector", "in_cluster", "mean_tf2",
+                   "mean_precision", "mean_recall", "mean_ndt",
+                   "mean_mean_delay", "mean_far"]],
+          "Best config per detector x mode (mean over the mode's tuning "
+          "streams), ranked by TF2:")
+    print("\nClusters (top "
+          f"{config.CLUSTER_SIZE} per mode by TF2): "
+          + "; ".join(f"{mode} = {' + '.join(dets)}"
+                      for mode, dets in clusters.items()))
     print(f"\nWrote {out_json} and tuning_summary.csv")
-    print(f"\nCluster assignment in drift_ensemble/config.py: "
-          f"{config.CLUSTER_MEMBERS}. Check that tuning_summary.csv still "
-          f"justifies it: a detector belongs to the cluster whose params "
-          f"hurt it least on the other stream type (see config.py).")
-
-
-def step_phase2(args) -> None:
-    import json
-
-    import pandas as pd
-
-    from drift_ensemble import config, tuning
-
-    ids = _tuning_streams_cached()
-    per_mode = {m: sum(1 for s in ids if s.split(",")[1] == m)
-                for m in config.PURE_MODES}
-    tasks = tuning.phase2_tasks()
-    done = tuning.done_counts(tuning.PHASE2_RUNS_CSV, tuning.PHASE2_TASK_KEY)
-    pending = [t for t in tasks
-               if done.get(t, 0) < tuning.phase2_n_rows(t, per_mode[t[0]])]
-    print(f"Phase 2: M grid {config.MIN_INSTANCES_GRID}, clusters "
-          f"{config.CLUSTER_MEMBERS}")
-    print(f"{len(tasks)} configs (each on its cluster's {per_mode} tuning "
-          f"streams); {len(pending)} still to evaluate.")
-    run_pool(tuning.phase2_run_task, pending, workers=args.workers,
-             yes=args.yes, what="config", init=tuning.worker_init,
-             initargs=(ids,), every=10,
-             done=lambda rows: tuning.append_rows(
-                 tuning.PHASE2_RUNS_CSV, tuning.PHASE2_ROW_FIELDS, rows))
-
-    # Selection, always redone from the full CSV.
-    phase1_path = config.TUNING_DIR / "tuning_summary.csv"
-    phase1 = pd.read_csv(phase1_path) if phase1_path.exists() else None
-    chosen, summary = tuning.select_min_instances(tuning.load_phase2_runs(),
-                                                  phase1_summary=phase1)
-    summary.to_csv(tuning.PHASE2_SUMMARY_CSV, index=False)
-    config.CLUSTER_PARAMS_PATH.write_text(json.dumps(chosen, indent=2))
-
-    obj = config.TUNE_OBJECTIVE
-    _show(summary[["cluster", "min_instances", "cluster_score", "detector",
-                   f"mean_{obj}", "mean_precision", "mean_recall",
-                   "mean_mean_delay", f"phase1_mean_{obj}", "chosen"]],
-          f"\nBest config per member at each M (cluster_score = mean of the "
-          f"two members' {obj}; phase1 = no shared minimum):")
-    print("\nChosen minimum per cluster: "
-          + ", ".join(f"{c} M = {m}"
-                      for c, m in chosen["min_instances"].items()))
-    for cluster in config.CLUSTER_MEMBERS:
-        for name, params in chosen[cluster].items():
-            print(f"  {cluster:8s} {name:13s} {params}")
-    print(f"\nWrote {tuning.PHASE2_SUMMARY_CSV}\n"
-          f"Wrote {config.CLUSTER_PARAMS_PATH}")
 
 
 def step_test(args) -> None:
     from drift_ensemble import config
     from drift_ensemble.runs import (
         is_run_done,
-        load_cluster_params,
         load_selected_params,
+        methods as roster,
         run_and_save,
     )
     from streams import stream_id
 
-    load_selected_params()  # fail fast if phase 1 has not run
-    params = load_cluster_params()  # ... or phase 2
-    print(f"Phase-1 params (singles, ens_raw_resetall): "
-          f"{config.TUNING_DIR / 'selected_params.json'}")
-    print(f"Phase-2 params ({', '.join(config.PHASE2_METHODS)}): "
-          f"{config.CLUSTER_PARAMS_PATH}, min_instances = "
-          f"{params['min_instances']}")
+    selected = load_selected_params()  # fail fast if tuning has not run
+    print(f"Tuned params: {config.TUNING_DIR / 'selected_params.json'}")
 
     specs = config.test_stream_specs()
     print(f"Cache dir: {config.CACHE_DIR}")
-    _cache_streams(specs, args, "Test streams")
+    _cache_streams(specs + config.recurring_stream_specs(), args,
+                   "Test streams (RECURRING: cached only, not run)")
 
-    methods = args.methods or config.METHODS
+    methods = args.methods or roster(selected)
+    unknown = sorted(set(methods) - set(roster(selected)))
+    if unknown:
+        raise SystemExit(f"not in the roster {roster(selected)}: {unknown}")
     units = [(g, m, s, meth) for (g, m, s) in specs for meth in methods
              if not is_run_done(stream_id(g, m, s), meth)]
     print(f"\nTest runs: {len(specs)} streams x {len(methods)} methods; "
@@ -297,8 +250,8 @@ def step_stats(args) -> None:
     if summary.empty:
         return
     _show(summary, f"\nPer method x mode (max delay {config.MAX_DELAY}): "
-                   f"mean and std of P/R/F1 over runs; delay = median over "
-                   f"detected drifts")
+                   f"mean and std of precision / recall / TF2 / NDT over "
+                   f"runs; delay = median over detected drifts")
     print(f"\nStatistics written to {config.STATISTICS_DIR}")
 
 
@@ -328,9 +281,11 @@ def step_screen(args) -> None:
                  done=lambda rows: tuning.append_rows(
                      path, tuning.ROW_FIELDS, rows))
 
-    stage(tuning.screening_tuning_tasks(study), tune_ids,
-          tuning.SCREENING_TUNING_CSV, "Tuning streams")
-    tuning_df = tuning.load_screening_rows(tuning.SCREENING_TUNING_CSV)
+    tune_tasks = tuning.screening_tuning_tasks(study)
+    stage(tune_tasks, tune_ids, tuning.SCREENING_TUNING_CSV,
+          "Tuning streams")
+    tuning_df = tuning.only_tasks(
+        tuning.load_screening_rows(tuning.SCREENING_TUNING_CSV), tune_tasks)
     selected = tuning.screening_selected(tuning_df, study)
     (config.SCREENING_DIR / "selected_params.json").write_text(
         tuning.screening_selected_json(selected))
@@ -341,10 +296,10 @@ def step_screen(args) -> None:
         selected)
     config.STATISTICS_DIR.mkdir(parents=True, exist_ok=True)
     summary.to_csv(tuning.SCREENING_SUMMARY_CSV, index=False)
-    _show(summary.drop(columns=["test_f1_mean"]),
-          "\nEach detector with the config tuned for the mode (tuning_f1 = "
-          "mean over 9 tuning streams; test_* = medians over 15 test "
-          "streams)")
+    _show(summary,
+          "\nEach detector with the config tuned for the mode (tuning_tf2 = "
+          "mean over the mode's tuning streams; test_* = means over its test "
+          "streams, test_delay = median)")
     print(f"\nWritten to {tuning.SCREENING_SUMMARY_CSV}")
 
 
@@ -410,11 +365,9 @@ STEPS = {
     "cache": (step_cache, "drift_ensemble",
               "cache the HT errors of the tuning streams"),
     "tune": (step_tune, "drift_ensemble",
-             "tuning phase 1: every grid config on the tuning streams"),
+             "tuning: every grid config on the tuning streams"),
     "select": (step_select, "drift_ensemble",
-               "tuning phase 1: best config per detector x mode"),
-    "phase2": (step_phase2, "drift_ensemble",
-               "tuning phase 2: each cluster's shared minimum"),
+               "tuning: best config per detector x mode, and the clusters"),
     "test": (step_test, "drift_ensemble",
              "run the 7 methods on the test streams"),
     "stats": (step_stats, "drift_ensemble", "statistics of experiment 1"),
@@ -425,12 +378,12 @@ STEPS = {
     "real": (step_real, "ensemble_experiment",
              "DDD on the real datasets, and their statistics"),
     "screen": (step_screen, None,
-               "screen DDM / HDDMAverage / ADWIN (not in the full run)"),
+               "screen DDM / HDDMAverage / ADWIN / KSWIN (not in the full "
+               "run)"),
 }
 
 
 def build_parser() -> argparse.ArgumentParser:
-    from drift_ensemble import config as c1
     from ensemble_experiment import config as c2
 
     ap = argparse.ArgumentParser(
@@ -461,14 +414,13 @@ def build_parser() -> argparse.ArgumentParser:
          for name, (_, _, desc) in STEPS.items()}
     p["tune"].add_argument("--limit", type=int, default=None,
                            help="only the first N configs (smoke testing)")
-    p["select"].add_argument("--objective", default=None,
-                             choices=["f1", "f2", "delay_auc"],
-                             help="default: config.TUNE_OBJECTIVE")
-    p["test"].add_argument("--methods", nargs="+", choices=c1.METHODS)
+    p["test"].add_argument("--methods", nargs="+",
+                           help="default: the 7 of the tuned roster")
     p["ddd"].add_argument("--generators", nargs="+", choices=c2.GENERATORS)
     p["ddd"].add_argument("--modes", nargs="+", choices=c2.MODES)
     p["ddd"].add_argument("--seeds", nargs="+", type=int)
-    p["ddd"].add_argument("--methods", nargs="+", choices=c2.METHODS)
+    p["ddd"].add_argument("--methods", nargs="+",
+                          help="default: the 7 of the tuned roster")
     p["real"].add_argument("--datasets", nargs="+",
                            choices=list(c2.REAL_DATASETS))
     p["real"].add_argument("--methods", nargs="+",

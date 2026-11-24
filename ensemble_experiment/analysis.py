@@ -54,7 +54,7 @@ KEYS = ["generator", "mode", "seed", "method"]
 def load_runs(runs_dir=None, method: str | None = None
               ) -> tuple[pd.DataFrame, list]:
     """(episodes, metas) of every complete run of ``method`` (default: every
-    roster method); metas = [(run folder, meta dict)]."""
+    method); metas = [(run folder, meta dict)]."""
     runs_dir = config.RUNS_DIR if runs_dir is None else runs_dir
     eps, metas = [], []
     if not runs_dir.exists():
@@ -64,8 +64,6 @@ def load_runs(runs_dir=None, method: str | None = None
         if not meta_path.exists():
             continue
         meta = json.loads(meta_path.read_text())
-        if meta["method"] not in config.METHODS:
-            continue  # stale method
         if method is not None and meta["method"] != method:
             continue
         ep = pd.read_csv(d / "episodes.csv")

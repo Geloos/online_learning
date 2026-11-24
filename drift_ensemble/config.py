@@ -77,7 +77,7 @@ STATISTICS_DIR = PROJECT_ROOT / "statistics" / "drift_ensemble"
 # ---------------------------------------------------------------------------
 # Streams (built by the shared streams.py)
 # ---------------------------------------------------------------------------
-GENERATORS = ["Agrawal", "SEA", "STAGGER"]
+GENERATORS = ["Agrawal", "SEA", "Sine"]
 N_DRIFTS = 30  # MIXED streams: half abrupt, half gradual (15 / 15)
 DRIFT_EVERY_N = 10_000
 GRADUAL_WIDTH = 2_000
@@ -90,20 +90,25 @@ STREAM_SIZES = {
     # adding it left every earlier plan and cached stream unchanged.
     "n_concepts": RECURRING_N_CONCEPTS,
 }
-# All 3 generators (15 MIXED test streams, was Agrawal only = 5): with 5
-# pairs Wilcoxon cannot reach p < 0.0625, so MIXED could never be significant.
-MIXED_GENERATORS = ["Agrawal", "SEA", "STAGGER"]
+# All 3 generators (was Agrawal only): with 5 pairs Wilcoxon cannot reach
+# p < 0.0625, so MIXED could never be significant.
+MIXED_GENERATORS = ["Agrawal", "SEA", "Sine"]
 # RECURRING (added 2026-11-20): like MIXED, but cycling through
-# RECURRING_N_CONCEPTS concepts. Test-only, like MIXED.
-RECURRING_GENERATORS = ["Agrawal", "SEA", "STAGGER"]
-MODES = ["ABRUPT", "GRADUAL", "MIXED", "RECURRING"]
+# RECURRING_N_CONCEPTS concepts. Since 2026-11-24 (user's request) its test
+# streams are only generated and cached by the `test` step: no method runs
+# on them and they get no statistics (recurring_stream_specs).
+RECURRING_GENERATORS = ["Agrawal", "SEA", "Sine"]
+MODES = ["ABRUPT", "GRADUAL", "MIXED"]  # modes the methods run and are scored on
 PURE_MODES = ("ABRUPT", "GRADUAL")  # tuning uses the pure modes only
 
 # ---------------------------------------------------------------------------
 # Seeds (tuning and test seeds must never overlap — asserted below)
 # ---------------------------------------------------------------------------
-TUNING_SEEDS = [1, 2, 3]
-TEST_SEEDS = [101, 102, 103, 104, 105]
+# 17 seeds each (2026-11-24, was 3 and 5): 3 generators x 2 modes x 17 =
+# 102 tuning streams; 3 generators x 3 modes x 17 = 153 test streams, plus
+# 51 RECURRING streams that are only cached.
+TUNING_SEEDS = list(range(1, 18))
+TEST_SEEDS = list(range(101, 118))
 assert not set(TUNING_SEEDS) & set(TEST_SEEDS), "tuning and test seeds overlap"
 
 
@@ -113,30 +118,37 @@ def tuning_stream_specs() -> list[tuple[str, str, int]]:
 
 
 def test_stream_specs() -> list[tuple[str, str, int]]:
+    """The test streams the methods run on (ABRUPT, GRADUAL, MIXED)."""
     pure = [(g, mode, s) for g in GENERATORS for mode in PURE_MODES
             for s in TEST_SEEDS]
     mixed = [(g, "MIXED", s) for g in MIXED_GENERATORS for s in TEST_SEEDS]
-    recurring = [(g, "RECURRING", s) for g in RECURRING_GENERATORS
-                 for s in TEST_SEEDS]
-    return pure + mixed + recurring
+    return pure + mixed
+
+
+def recurring_stream_specs() -> list[tuple[str, str, int]]:
+    """RECURRING test streams: cached by the `test` step, not run on."""
+    return [(g, "RECURRING", s) for g in RECURRING_GENERATORS
+            for s in TEST_SEEDS]
 
 # ---------------------------------------------------------------------------
 # Learner / detection
 # ---------------------------------------------------------------------------
 MIN_TRAINING_SIZE = 1000  # detectors (and HT error logging) start after this
 MAX_DELAY = 500
-DELAY_GRID = list(range(50, 501, 50))  # [50, 100, ..., 500]
 DUPLICATES_AS_FP = True  # extra alarms inside an already-matched window = FP
 
-# Statistics (drift_ensemble/stats.py -> STATISTICS_DIR): medians per
-# method x mode, and the delay curves rescore every run for each max delay
-# in delay_grid (0 = alarm must fall inside the drift itself).
+# Statistics (drift_ensemble/stats.py -> STATISTICS_DIR): the delay curves
+# rescore every run for each max delay in delay_grid (0 = alarm must fall
+# inside the drift itself).
 STATS = {"delay_grid": list(range(0, 501, 25))}
 
 # ---------------------------------------------------------------------------
 # Tuning
 # ---------------------------------------------------------------------------
-TUNE_OBJECTIVE = "f1"  # options: 'f1', 'f2', 'delay_auc'
+# The one selection score (2026-11-24, replaced F1): TF2 = F2(precision,
+# recall x (1 - NDT)), see stats.py. It picks every detector's params per
+# mode AND the clusters.
+TUNE_OBJECTIVE = "tf2"
 SEED_RANDOM_CONFIGS = 100  # SEED grid has 700 combos -> sample 100 (seeded)
 GRID_SAMPLE_SEED = 20240  # rng seed used to subsample oversized grids
 
@@ -179,45 +191,24 @@ DEFAULT_PARAMS = {
     "DDM": {"min_n_instances": 30, "out_control_level": 3.0},
     "HDDMAverage": {"drift_confidence": 0.001, "test_type": "Two-sided"},
     "ADWIN": {"delta": 0.002},
+    # not in capymoa: the defaults of scikit-multiflow's and River's KSWIN
+    "KSWIN": {"alpha": 0.005, "window_size": 100, "stat_size": 30},
 }
 
 # ---------------------------------------------------------------------------
-# Tuning phase 2: a shared minimum per cluster
-# (tuning.py, `python main.py phase2`).
-#
-# Each detector has its own minimum number of instances after a reset
-# before it can fire (measured by probe on 2026-11-23, 0s then 1s right
-# after a reset): STEPD 2 x window_size, SEED 2 x block_size, RDDM
-# min_n_instances, HDDMWeighted none (a statistical test only). With the
-# phase-1 params the two detectors of a cluster therefore switched back on
-# at different times after every alarm (e.g. RDDM 2000 vs HDDMWeighted
-# ~230).
-#
-# Phase 2 gives each cluster ONE minimum M (M_A for ABRUPT, M_G for
-# GRADUAL, tuned separately; equal only if tuning says so):
-#   - a gate: after a reset (stream start, reset-all) or after an accepted
-#     fire, a detector's fires are ignored until it has seen M instances.
-#     The detector keeps updating its statistics meanwhile.
-#   - RDDM's min_n_instances is set to M; STEPD and SEED may only use
-#     configs whose own minimum is <= M (so the gate decides when they
-#     start, not their params). HDDMWeighted can use every config.
-# For each M in the grid, the cluster's two detectors are re-tuned on the
-# cluster's own mode (ABRUPT or GRADUAL tuning streams, phase-1 grids).
-# The cluster's score at M is the mean of its two detectors' best mean
-# TUNE_OBJECTIVE; the M with the highest score wins. Output:
-# tuning/cluster_params.json, used by the two-vote methods only
-# (PHASE2_METHODS: ens_cluster_vote, ens_cluster_sens) in both experiments.
-# ---------------------------------------------------------------------------
-MIN_INSTANCES_GRID = [50, 100, 200, 300, 500, 1000, 2000]
-CLUSTER_PARAMS_PATH = TUNING_DIR / "cluster_params.json"
-
-# ---------------------------------------------------------------------------
 # Detector screening (`python main.py screen`, tuning.py): extra
-# capymoa detectors tuned and tested as singles on the CACHED errors only, to
-# see whether one beats the study's 4 on ABRUPT / GRADUAL F1. They are NOT
-# in the roster, the clusters or the ensembles. These grids are our own
-# ranges around capymoa's defaults (not from Cerqueira et al.). Only the
-# drift threshold matters here: warning levels are left at their defaults.
+# detectors tuned and tested as singles on the CACHED errors only, to
+# see whether one beats the study's 4 on ABRUPT / GRADUAL TF2. They are NOT
+# in the roster, the clusters or the ensembles. Only the drift threshold
+# matters here: warning levels are left at their defaults.
+#   - DDM: our own ranges around capymoa's defaults.
+#   - HDDMAverage, ADWIN: the values the user gave on 2026-11-24 (same
+#     drift_confidence values as HDDMWeighted's grid); ADWIN also keeps
+#     delta 0.1, which won with our earlier, wider grid.
+#   - KSWIN (2026-11-24, not in capymoa 0.9.0 or MOA: our own
+#     implementation, detectors.KSWIN): our own ranges around the usual
+#     defaults. Configs with window_size < 2 * stat_size are left out
+#     (the random sample is drawn from the older window_size - stat_size).
 # ---------------------------------------------------------------------------
 SCREENING_DIR = RESULTS_DIR / "screening"
 SCREENING_GRIDS = {
@@ -225,42 +216,33 @@ SCREENING_GRIDS = {
         "min_n_instances": [30, 50, 100, 300, 500, 1000, 2000],
         "out_control_level": [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0],
     },
-    "HDDMAverage": {  # 16 combos
-        "drift_confidence": [0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01,
-                             0.05, 0.1],
+    "HDDMAverage": {  # 10 combos
+        "drift_confidence": [0.0001, 0.001, 0.002, 0.005, 0.01],
         "test_type": ["One-sided", "Two-sided"],
     },
-    "ADWIN": {  # 10 combos
-        "delta": [1e-6, 1e-5, 1e-4, 5e-4, 0.001, 0.002, 0.005, 0.01, 0.05,
-                  0.1],
+    "ADWIN": {  # 7 combos
+        "delta": [0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.1],
+    },
+    "KSWIN": {  # 60 combos, 55 valid
+        "alpha": [0.0001, 0.001, 0.005, 0.01, 0.05],
+        "window_size": [100, 300, 500, 1000],
+        "stat_size": [30, 50, 100],
     },
 }
 
 # ---------------------------------------------------------------------------
-# Clusters (membership justified by tuning/tuning_summary.csv)
-# Abrupt-cluster detectors run with their ABRUPT-tuned params, gradual-cluster
-# detectors with their GRADUAL-tuned params (see selected_params.json).
-#
-# Assignment (2026-11-20, tuning with MAX_DELAY = 500): a detector always
-# runs with its cluster's params, so it goes to the cluster whose params hurt
-# it least on the other stream type. Median test F1 (ABRUPT / GRADUAL
-# streams) with the ABRUPT-tuned vs the GRADUAL-tuned params
-# (statistics/drift_ensemble/screening.csv, results/.../screening/):
-#   HDDMWeighted 0.596 / 0.536  vs  0.074 / 0.553  -> ABRUPT
-#   STEPD        0.345 / 0.383  vs  0.178 / 0.516  -> GRADUAL
-#   SEED         0.317 / 0.441  vs  0.328 / 0.438  -> GRADUAL (no difference)
-#   RDDM         same params for both modes        -> ABRUPT (2nd-best
-#                detector on ABRUPT, tuning F1 0.476)
-# The earlier rule ("the mode with the higher tuning F1") no longer works:
-# with the 500 window every detector scores higher on GRADUAL (a gradual
-# drift's window is GRADUAL_WIDTH + MAX_DELAY wide).
+# Clusters (2026-11-24, user's rule; replaced the hand-made split): the
+# `select` step puts the CLUSTER_SIZE detectors with the best mean tuning
+# TF2 on ABRUPT streams in the ABRUPT cluster, and the best on GRADUAL
+# streams in the GRADUAL cluster (ties: precision, then DETECTOR_ORDER).
+# Each member runs with the params tuned for its cluster's mode, so one
+# detector can be in BOTH clusters as two members with different params
+# (e.g. HDDMWeighted_ABRUPT and HDDMWeighted_GRADUAL). The result is in
+# selected_params.json ("clusters"); runs.members() lists the members.
 # ---------------------------------------------------------------------------
-CLUSTER_MEMBERS = {
-    "ABRUPT": ["HDDMWeighted", "RDDM"],
-    "GRADUAL": ["STEPD", "SEED"],
-}
-# Fixed tie-break order for choosing the trigger when several detectors fire
-# on the same instance.
+CLUSTER_SIZE = 2  # the vote ensembles pair the two members of a cluster
+# Fixed detector order: tuning ties, member order inside a cluster, and the
+# order the ensembles poll their members in.
 DETECTOR_ORDER = ["STEPD", "SEED", "HDDMWeighted", "RDDM"]
 
 # ---------------------------------------------------------------------------
@@ -323,29 +305,21 @@ DETECTOR_SELF_RESETS = {
     "DDM": True,
     "HDDMAverage": True,
     "ADWIN": True,
+    "KSWIN": True,  # by construction: keeps only stat_size inputs
 }
 
 # ---------------------------------------------------------------------------
-# Test-run methods. ens_raw (OR, each detector only self-resets) was dropped
-# on 2026-11-23: DDD (experiment 2) can't use it, so both experiments share
-# the same 7 methods.
+# Test-run methods, the same 7 in both experiments: one single_<member> per
+# cluster member (4, named after the tuning: runs.methods) and these 3
+# ensembles over the 4 members. ens_raw (OR, each detector only
+# self-resets) was dropped on 2026-11-23: DDD (experiment 2) can't use it.
 # ---------------------------------------------------------------------------
-METHODS = [
-    "single_STEPD",
-    "single_SEED",
-    "single_HDDMWeighted",
-    "single_RDDM",
+ENSEMBLE_METHODS = [
     "ens_raw_resetall",
     "ens_cluster_vote",
     "ens_cluster_sens",
 ]
-# Which tuning each method runs with (user's choice, 2026-11-23): the two
-# methods that need two votes from a cluster use tuning phase 2
-# (cluster_params.json: the cluster's shared minimum + its re-tuned
-# params). The singles and ens_raw_resetall use phase 1
-# (selected_params.json: each detector tuned alone, its cluster's mode
-# params, no shared minimum), in both experiments.
-PHASE2_METHODS = ["ens_cluster_vote", "ens_cluster_sens"]
+
 
 def snapshot() -> dict:
     """The config values that define an experiment, for meta.json files."""
@@ -359,14 +333,11 @@ def snapshot() -> dict:
         "INIT_FUNCTION": streams.INIT_FUNCTION,
         "MIN_TRAINING_SIZE": MIN_TRAINING_SIZE,
         "MAX_DELAY": MAX_DELAY,
-        "DELAY_GRID": DELAY_GRID,
         "DUPLICATES_AS_FP": DUPLICATES_AS_FP,
         "TUNE_OBJECTIVE": TUNE_OBJECTIVE,
         "SEED_RANDOM_CONFIGS": SEED_RANDOM_CONFIGS,
         "GRID_SAMPLE_SEED": GRID_SAMPLE_SEED,
-        "MIN_INSTANCES_GRID": MIN_INSTANCES_GRID,
-        "PHASE2_METHODS": PHASE2_METHODS,
-        "CLUSTER_MEMBERS": CLUSTER_MEMBERS,
+        "CLUSTER_SIZE": CLUSTER_SIZE,
         "DETECTOR_ORDER": DETECTOR_ORDER,
         "VOTE": VOTE,
         "SENS": SENS,

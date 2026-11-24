@@ -40,7 +40,9 @@ import numpy as np
 FUNCTIONS = {
     "SEA": [1, 2, 3, 4],
     "Agrawal": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-    "STAGGER": [1, 2, 3],
+    # SINE1, reversed SINE1, SINE2, reversed SINE2 (replaced STAGGER on
+    # 2026-11-24).
+    "Sine": [1, 2, 3, 4],
 }
 INIT_FUNCTION = 1  # first concept of ABRUPT / GRADUAL / MIXED streams
 MODES = ("ABRUPT", "GRADUAL", "MIXED", "RECURRING")
@@ -160,7 +162,7 @@ def _make_concept(generator: str, function: int, instance_seed: int):
     from capymoa.stream.generator import (
         SEA,
         AgrawalGenerator,
-        STAGGERGenerator,
+        SineGenerator,
     )
 
     if generator == "SEA":
@@ -168,8 +170,8 @@ def _make_concept(generator: str, function: int, instance_seed: int):
     if generator == "Agrawal":
         return AgrawalGenerator(instance_random_seed=instance_seed,
                                 classification_function=function)
-    if generator == "STAGGER":
-        return STAGGERGenerator(instance_random_seed=instance_seed,
+    if generator == "Sine":
+        return SineGenerator(instance_random_seed=instance_seed,
                                 classification_function=function)
     raise ValueError(f"unknown generator: {generator!r}")
 

@@ -1,13 +1,12 @@
 """Detector tuning on the cached HT errors.
 
-  * phase 1    every grid config of every detector on the 18 tuning
+  * tuning     every grid config of every detector on the 102 tuning
                streams -> tuning_runs.csv; the best config per detector x
-               mode -> selected_params.json (+ a leave-one-generator-out
-               check). Used by the singles and ens_raw_resetall.
-  * phase 2    one shared minimum per cluster; the cluster's detectors
-               re-tuned under it -> cluster_params.json. Used by the
-               two-vote ensembles (config.PHASE2_METHODS).
-  * screening  extra capymoa detectors (DDM, HDDMAverage, ADWIN) as singles
+               mode by TF2, and the clusters (the CLUSTER_SIZE best
+               detectors per mode by TF2) -> selected_params.json (+ a
+               leave-one-generator-out check). Every method of both
+               experiments runs with it.
+  * screening  extra detectors (DDM, HDDMAverage, ADWIN, KSWIN) as singles
                against the study's 4 (`python main.py screen`; not part of
                the full run)
 
@@ -25,19 +24,14 @@ import pandas as pd
 
 from drift_ensemble import config
 from drift_ensemble.config import PURE_MODES, tuning_stream_specs
-from drift_ensemble.detectors import (
-    gate_alarms,
-    iter_configs,
-    own_minimum,
-    run_detector_on_errors,
-)
+from drift_ensemble.detectors import iter_configs, run_detector_on_errors
 from drift_ensemble.runs import load_cache
-from drift_ensemble.stats import compute_metrics, delay_curve
+from drift_ensemble.stats import compute_metrics
 from streams import stream_id
 
 
 # ===========================================================================
-# Phase 1: evaluation
+# Tuning: evaluation
 #
 # Grid/random search of detector parameters on cached HT errors.
 #
@@ -49,8 +43,8 @@ from streams import stream_id
 TUNING_RUNS_CSV = config.TUNING_DIR / "tuning_runs.csv"
 ROW_FIELDS = [
     "detector", "params", "generator", "mode", "seed",
-    "tp", "fp", "fn", "precision", "recall", "f1", "f2",
-    "mean_delay", "far", "delay_auc",
+    "tp", "fp", "fn", "precision", "recall", "ndt", "tf2",
+    "mean_delay", "far",
 ]
 
 
@@ -75,15 +69,12 @@ def score_alarms(alarms, sid: str, ground_truth: list[dict],
         alarms, ground_truth, config.MAX_DELAY, length,
         config.MIN_TRAINING_SIZE, config.DUPLICATES_AS_FP,
     )
-    dc = delay_curve(alarms, ground_truth, config.DELAY_GRID,
-                     config.DUPLICATES_AS_FP)
     generator, mode, seed = sid.split(",")
     return {
         "generator": generator,
         "mode": mode,
         "seed": int(seed),
         **metrics,
-        "delay_auc": dc["delay_auc"],
     }
 
 
@@ -134,7 +125,7 @@ def tuning_stream_ids() -> list[str]:
     return [stream_id(*spec) for spec in tuning_stream_specs()]
 
 
-# Resumable CSVs (phase 1, phase 2 and screening): a task is done once it
+# Resumable CSVs (tuning and screening): a task is done once it
 # has written all its rows.
 def done_counts(path, key=("detector", "params")) -> dict:
     """Rows already written, per task key."""
@@ -158,16 +149,17 @@ def append_rows(path, fields, rows) -> None:
 
 
 # ===========================================================================
-# Phase 1: selection
+# Tuning: selection
 #
 # Parameter selection from tuning runs.
 #
 # For each detector and each mode (ABRUPT, GRADUAL) separately: the config
-# with the highest mean TUNE_OBJECTIVE over all tuning streams of that mode
-# (all generators, all tuning seeds). Ties go to the higher mean precision.
+# with the highest mean TUNE_OBJECTIVE (TF2) over all tuning streams of that
+# mode (all generators, all tuning seeds). Ties go to the higher mean
+# precision. Then the clusters: per mode, the CLUSTER_SIZE detectors whose
+# selected config has the highest mean TF2 (select_clusters).
 # ===========================================================================
-METRIC_COLS = ["f1", "f2", "precision", "recall", "mean_delay", "far",
-               "delay_auc"]
+METRIC_COLS = ["tf2", "precision", "recall", "ndt", "mean_delay", "far"]
 
 
 def load_tuning_runs(path=None) -> pd.DataFrame:
@@ -232,6 +224,29 @@ def select_params(df: pd.DataFrame, objective: str | None = None,
     return selected, summary
 
 
+def select_clusters(summary: pd.DataFrame, size: int | None = None
+                    ) -> tuple[dict, pd.DataFrame]:
+    """({mode: [detectors]}, summary + rank / in_cluster columns): per mode,
+    the ``size`` (default config.CLUSTER_SIZE) detectors with the highest
+    mean objective of their selected config. Ties: higher mean precision,
+    then DETECTOR_ORDER. A detector may be picked for both modes."""
+    size = config.CLUSTER_SIZE if size is None else size
+    objective = summary["objective"].iloc[0]
+    out = summary.copy()
+    out["_order"] = out["detector"].map(config.DETECTOR_ORDER.index)
+    out = out.sort_values(
+        ["mode", f"mean_{objective}", "mean_precision", "_order"],
+        ascending=[True, False, False, True], kind="stable")
+    out["rank"] = out.groupby("mode").cumcount() + 1
+    out["in_cluster"] = out["rank"] <= size
+    clusters = {mode: [d for d in config.DETECTOR_ORDER
+                       if d in set(out[(out["mode"] == mode)
+                                       & out["in_cluster"]]["detector"])]
+                for mode in PURE_MODES}
+    out = out.drop(columns="_order").sort_values(["mode", "rank"])
+    return clusters, out.reset_index(drop=True)
+
+
 def logo_check(df: pd.DataFrame, objective: str | None = None
                ) -> pd.DataFrame:
     """Leave-one-generator-out robustness check: select on 2 generators,
@@ -267,212 +282,32 @@ def logo_check(df: pd.DataFrame, objective: str | None = None
 
 
 # ===========================================================================
-# Phase 2: one shared minimum per cluster
-#
-# Tuning phase 2: one shared minimum M per cluster
-# (config.MIN_INSTANCES_GRID; the rule is explained above it in config.py).
-#
-# Runs on the cached tuning streams of the cluster's own mode (the ABRUPT
-# cluster on the ABRUPT streams, GRADUAL on GRADUAL), with the phase-1 grids:
-#
-#   RDDM          min_n_instances is replaced by M (one config per
-#                 drift_level x M)
-#   STEPD, SEED   every config, scored at each M >= its own minimum
-#                 (detectors.own_minimum)
-#   HDDMWeighted  every config, scored at every M
-#
-# One task = one (cluster, detector, config) on its mode's streams. A single
-# detector is never reset explicitly, so its gated alarms at every M come from
-# ONE ungated replay (detectors.gate_alarms, exact in that case).
-#
-# Selection: for each cluster and M, each member's best config (highest mean
-# TUNE_OBJECTIVE; ties -> precision, then params, as in phase 1). The
-# cluster's score at M is the mean of its two members' best. The M with the
-# highest score wins (ties -> higher mean precision, then the smaller M).
-# ===========================================================================
-PHASE2_RUNS_CSV = config.TUNING_DIR / "phase2_runs.csv"
-PHASE2_SUMMARY_CSV = config.TUNING_DIR / "phase2_summary.csv"
-PHASE2_ROW_FIELDS = ["cluster", "min_instances", *ROW_FIELDS]
-PHASE2_TASK_KEY = ["cluster", "detector", "params"]
-
-
-def fitting_minimums(name: str, params: dict, grid=None) -> list[int]:
-    """The grid values M at which this config may run in its cluster."""
-    grid = config.MIN_INSTANCES_GRID if grid is None else grid
-    if name == "RDDM":  # its own minimum IS the cluster's minimum
-        return [m for m in grid if m == int(params["min_n_instances"])]
-    return [m for m in grid if own_minimum(name, params) <= m]
-
-
-def phase2_tasks(grid=None) -> list[tuple[str, str, str]]:
-    """Every (cluster, detector, params_json), in deterministic order.
-    Configs that fit no M in the grid are left out."""
-    grid = config.MIN_INSTANCES_GRID if grid is None else grid
-    tasks = []
-    for cluster, members in config.CLUSTER_MEMBERS.items():
-        assert cluster in config.PURE_MODES, cluster
-        for name in members:
-            configs = iter_configs(name)
-            if name == "RDDM":
-                configs = [{**p, "min_n_instances": m}
-                           for m in grid for p in configs]
-            seen = set()
-            for p in configs:
-                key = params_key(p)
-                if key not in seen and fitting_minimums(name, p, grid):
-                    seen.add(key)
-                    tasks.append((cluster, name, key))
-    return tasks
-
-
-def phase2_n_rows(task, n_streams_per_mode: int) -> int:
-    """Rows a finished task has written."""
-    _, name, pjson = task
-    return n_streams_per_mode * len(fitting_minimums(name, json.loads(pjson)))
-
-
-def phase2_run_task(task: tuple[str, str, str]) -> list[dict]:
-    """One config on every preloaded stream of its cluster's mode, scored
-    at every M it fits. Streams come from worker_init."""
-    cluster, name, pjson = task
-    params = json.loads(pjson)
-    minimums = fitting_minimums(name, params)
-    rows = []
-    for sid, errors, ground_truth, length in _WORKER_STREAMS:
-        if sid.split(",")[1] != cluster:
-            continue
-        raw = run_detector_on_errors(name, params, errors)
-        for m in minimums:
-            rows.append({
-                "cluster": cluster,
-                "min_instances": m,
-                "detector": name,
-                "params": pjson,
-                **score_alarms(gate_alarms(raw, errors, m), sid,
-                               ground_truth, length),
-            })
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# Resumable CSV
-# ---------------------------------------------------------------------------
-
-
-def load_phase2_runs(path=None) -> pd.DataFrame:
-    df = pd.read_csv(PHASE2_RUNS_CSV if path is None else path)
-    # A task interrupted mid-write may have been rerun: keep the last copy.
-    return df.drop_duplicates(
-        subset=["cluster", "min_instances", "detector", "params",
-                "generator", "mode", "seed"], keep="last")
-
-
-# ---------------------------------------------------------------------------
-# Selection
-# ---------------------------------------------------------------------------
-def select_min_instances(df: pd.DataFrame, objective: str | None = None,
-                         phase1_summary: pd.DataFrame | None = None
-                         ) -> tuple[dict, pd.DataFrame]:
-    """Returns (cluster_params, summary).
-
-    cluster_params = {"min_instances": {cluster: M}, cluster: {detector:
-    params}, ...}: the format runs.params_for / min_instances_for read.
-    summary has one row per cluster x M x member: the member's best config
-    at that M, the cluster's score, and whether that M was chosen.
-    ``phase1_summary`` (tuning_summary.csv) adds the member's phase-1 score
-    on the same streams, without a shared minimum, for comparison."""
-    objective = objective or config.TUNE_OBJECTIVE
-    phase1 = {}
-    if phase1_summary is not None:
-        phase1 = {(r["detector"], r["mode"]): r[f"mean_{objective}"]
-                  for _, r in phase1_summary.iterrows()}
-    rows = []
-    for cluster, members in config.CLUSTER_MEMBERS.items():
-        sub_c = df[df["cluster"] == cluster]
-        expected = sub_c[["generator", "seed"]].drop_duplicates().shape[0]
-        for m in sorted(sub_c["min_instances"].unique()):
-            best, n_streams = {}, {}
-            for name in members:
-                sub = sub_c[(sub_c["min_instances"] == m)
-                            & (sub_c["detector"] == name)]
-                if sub.empty:
-                    break
-                counts = sub.groupby("params").size()
-                if (counts < expected).any():
-                    print(f"WARNING: {cluster} M={m} {name}: "
-                          f"{int((counts < expected).sum())} configs on "
-                          f"fewer than {expected} streams")
-                means = (sub.groupby("params")[METRIC_COLS]
-                         .mean().reset_index())
-                best[name] = _rank(means, objective).iloc[0]
-                n_streams[name] = int(counts[best[name]["params"]])
-            if len(best) < len(members):
-                continue  # a member has no config that fits this M
-            score = sum(best[n][objective] for n in members) / len(members)
-            precision = (sum(best[n]["precision"] for n in members)
-                         / len(members))
-            for name in members:
-                rows.append({
-                    "cluster": cluster,
-                    "min_instances": int(m),
-                    "objective": objective,
-                    "cluster_score": score,
-                    "cluster_precision": precision,
-                    "detector": name,
-                    "params": best[name]["params"],
-                    "n_streams": n_streams[name],
-                    **{f"mean_{c}": best[name][c] for c in METRIC_COLS},
-                    f"phase1_mean_{objective}": phase1.get((name, cluster)),
-                })
-    summary = pd.DataFrame(rows)
-    if summary.empty:
-        raise ValueError("no phase-2 rows to select from")
-    summary["chosen"] = False
-    chosen: dict = {"min_instances": {}}
-    for cluster in config.CLUSTER_MEMBERS:
-        s = summary[summary["cluster"] == cluster]
-        if s.empty:
-            raise ValueError(f"no M in the grid fits every member of the "
-                             f"{cluster} cluster")
-        per_m = s.drop_duplicates("min_instances")
-        win = int(per_m.sort_values(
-            ["cluster_score", "cluster_precision", "min_instances"],
-            ascending=[False, False, True]).iloc[0]["min_instances"])
-        chosen["min_instances"][cluster] = win
-        chosen[cluster] = {
-            r["detector"]: json.loads(r["params"])
-            for _, r in s[s["min_instances"] == win].iterrows()
-        }
-        summary.loc[(summary["cluster"] == cluster)
-                    & (summary["min_instances"] == win), "chosen"] = True
-    return chosen, summary
-
-
-# ===========================================================================
 # Screening
 #
-# Screening of extra capymoa detectors (config.SCREENING_GRIDS: DDM,
-# HDDMAverage, ADWIN) against the study's 4, as single detectors on the cached
+# Screening of extra detectors (config.SCREENING_GRIDS: DDM, HDDMAverage,
+# ADWIN, KSWIN) against the study's 4, as single detectors on the cached
 # HT errors only. No new streams, no change to the roster or the ensembles.
 #
-#   1. tune     every screening-grid config on the 18 tuning streams, plus the
+#   1. tune     every screening-grid config on the tuning streams, plus the
 #               study's 4 with their selected configs, so every number comes
 #               from the same scoring code
 #               -> results/results_drift_ensemble/screening/tuning_runs.csv
 #   2. select   per new detector x mode (ABRUPT, GRADUAL): the config with the
-#               highest mean F1 over that mode's 9 tuning streams (the
-#               select_params rule); the study's 4 keep
-#               tuning/selected_params.json
+#               highest mean TF2 over that mode's tuning streams (the
+#               select_params rule), among the configs of the CURRENT grid
+#               (rows of configs dropped from a grid are ignored); the
+#               study's 4 keep tuning/selected_params.json
 #   3. test     every detector with its mode's config on the cached test
-#               streams of that mode (15 each)
+#               streams of that mode
 #               -> results/results_drift_ensemble/screening/test_runs.csv
 #   4. summary  two rows per detector x mode: the tuned config and capymoa's
-#               default (config.DEFAULT_PARAMS)
+#               default (config.DEFAULT_PARAMS); mean test TF2 / precision /
+#               recall / NDT, median delay
 #               -> statistics/drift_ensemble/screening.csv
 #
-# On the test streams the study's 4 run with the config tuned for the
-# stream's mode, unlike single_* in the roster, which always use their
-# cluster's config.
+# On the test streams every detector runs with the config tuned for the
+# stream's mode (like a cluster member, but for all 4 of the study's
+# detectors and both modes).
 # ===========================================================================
 SCREENING_DETECTORS = list(config.SCREENING_GRIDS)
 SCREENING_TUNING_CSV = config.SCREENING_DIR / "tuning_runs.csv"
@@ -505,8 +340,8 @@ def screening_tuning_tasks(study_selected: dict) -> list[tuple[str, str]]:
 
 def screening_selected(tuning_df: pd.DataFrame, study_selected: dict) -> dict:
     """{mode: {detector: params}} for the study's 4 (from
-    selected_params.json) and the new detectors (best mean F1 here)."""
-    new, _ = select_params(tuning_df, "f1", SCREENING_DETECTORS)
+    selected_params.json) and the new detectors (best mean TF2 here)."""
+    new, _ = select_params(tuning_df, "tf2", SCREENING_DETECTORS)
     return {mode: {**{d: study_selected[mode][d]
                       for d in config.DETECTOR_ORDER},
                    **new[mode]}
@@ -523,10 +358,11 @@ def screening_test_tasks(selected: dict) -> list[tuple[str, str]]:
 def screening_summary(tuning_df: pd.DataFrame, test_df: pd.DataFrame,
                       selected: dict) -> pd.DataFrame:
     """Two rows per detector x mode, setting = "tuned" (its selected
-    config) and "default" (capymoa's): mean F1 over the mode's tuning
-    streams, and medians over the mode's test streams (delay = median of
-    the per-stream mean delays). Sorted by setting, then best-first by test
-    F1 within each mode."""
+    config) and "default" (capymoa's): mean TF2 over the mode's tuning
+    streams, and means of TF2 / precision / recall / NDT over the mode's
+    test streams (delay = median of the per-stream mean delays, as delays
+    are skewed). Sorted by setting, then best-first by mean test TF2
+    within each mode."""
     settings = {"tuned": lambda mode, det: selected[mode][det],
                 "default": lambda mode, det: config.DEFAULT_PARAMS[det]}
 
@@ -544,11 +380,12 @@ def screening_summary(tuning_df: pd.DataFrame, test_df: pd.DataFrame,
         rows.append({
             "mode": mode, "setting": setting, "detector": det,
             "in_study": det in config.DETECTOR_ORDER, "params": pj,
-            "tuning_f1": tr["f1"].mean(), "n_test": len(te),
-            "test_f1": te["f1"].median(),
-            "test_f1_mean": te["f1"].mean(),
-            "test_precision": te["precision"].median(),
-            "test_recall": te["recall"].median(),
+            "tuning_tf2": tr["tf2"].mean(), "n_test": len(te),
+            "test_tf2": te["tf2"].mean(),
+            "test_tf2_std": te["tf2"].std(),
+            "test_precision": te["precision"].mean(),
+            "test_recall": te["recall"].mean(),
+            "test_ndt": te["ndt"].mean(),
             "test_delay": te["mean_delay"].median(),
         })
     df = pd.DataFrame(rows)
@@ -556,12 +393,19 @@ def screening_summary(tuning_df: pd.DataFrame, test_df: pd.DataFrame,
                                 ordered=True)
     df["setting"] = pd.Categorical(df["setting"], categories=list(settings),
                                    ordered=True)
-    df = df.sort_values(["mode", "setting", "test_f1"],
+    df = df.sort_values(["mode", "setting", "test_tf2"],
                         ascending=[True, True, False],
                         kind="stable").reset_index(drop=True)
     df["setting"] = df["setting"].astype(str)
     df["mode"] = df["mode"].astype(str)
     return df
+
+
+def only_tasks(df: pd.DataFrame, tasks) -> pd.DataFrame:
+    """The rows of the given (detector, params_json) tasks. Rows of
+    configs since dropped from a grid stay in the CSV but are not used."""
+    keep = set(tasks)
+    return df[[k in keep for k in zip(df["detector"], df["params"])]]
 
 
 def load_screening_rows(path) -> pd.DataFrame:

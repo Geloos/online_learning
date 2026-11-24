@@ -79,31 +79,54 @@ def test_overlapping_windows_assert():
         match_alarms([1100], truth, max_delay=1000)
 
 
+def tf2(p, r_t):
+    return 5 * p * r_t / (4 * p + r_t)
+
+
 def test_compute_metrics():
     r = compute_metrics([1100, 500], TRUTH, max_delay=1000,
                         n_instances=11000, min_training_size=1000)
     assert (r["tp"], r["fp"], r["fn"]) == (1, 1, 1)
     assert r["precision"] == 0.5 and r["recall"] == 0.5
-    assert r["f1"] == pytest.approx(0.5)
-    # F2 weights recall higher: (1+4)*P*R / (4P + R)
-    assert r["f2"] == pytest.approx(5 * 0.25 / (2 + 0.5))
+    assert r["ndt"] == pytest.approx(100 / 1000)
+    # timely recall = recall x (1 - NDT) = 0.5 x 0.9
+    assert r["tf2"] == pytest.approx(tf2(0.5, 0.45))
     assert r["mean_delay"] == 100.0
     assert r["far"] == pytest.approx(1 / 10.0)  # 1 FP per 10k monitored
+    assert "f1" not in r
 
 
 def test_metrics_no_alarms():
     r = compute_metrics([], TRUTH, 1000, 11000, 1000)
-    assert r["precision"] == 0.0 and r["recall"] == 0.0 and r["f1"] == 0.0
-    assert math.isnan(r["mean_delay"])
+    assert r["precision"] == 0.0 and r["recall"] == 0.0 and r["tf2"] == 0.0
+    assert math.isnan(r["mean_delay"]) and math.isnan(r["ndt"])
+
+
+def test_ndt_of_a_gradual_drift_uses_its_whole_window():
+    truth = gt((1000, 500, "GRADUAL"))
+    # window = width 500 + max delay 1000 = 1500; detected 600 in
+    r = compute_metrics([1600], truth, 1000, 5000, 0)
+    assert r["ndt"] == pytest.approx(600 / 1500)
+    assert r["tf2"] == pytest.approx(tf2(1.0, 1 - 0.4))
+
+
+def test_tf2_rewards_fast_detection_and_punishes_firing_all_the_time():
+    fast = compute_metrics([1050, 3050], TRUTH, 1000, 11000, 1000)["tf2"]
+    late = compute_metrics([1900, 3900], TRUTH, 1000, 11000, 1000)["tf2"]
+    spam = compute_metrics(list(range(1000, 11000, 10)), TRUTH, 1000,
+                           11000, 1000)
+    assert spam["recall"] == 1.0 and spam["ndt"] == 0.0
+    assert fast > late > spam["tf2"]
 
 
 def test_delay_curve():
     # Single drift, alarm 150 after the start: detected for m >= 200 only.
     truth = gt((1000, 0, "ABRUPT"))
-    dc = delay_curve([1150], truth, delay_grid=[100, 200, 300])
-    recalls = [p["recall"] for p in dc["points"]]
-    assert recalls == [0.0, 1.0, 1.0]
-    assert dc["delay_auc"] == pytest.approx(2 / 3)
+    points = delay_curve([1150], truth, delay_grid=[100, 200, 300])
+    assert [p["recall"] for p in points] == [0.0, 1.0, 1.0]
+    # NDT = 150 / max delay: 0.75 at 200, 0.5 at 300
+    assert [p["tf2"] for p in points] == pytest.approx(
+        [0.0, tf2(1.0, 0.25), tf2(1.0, 0.5)])
 
 
 def test_per_type():
@@ -128,7 +151,8 @@ RUN_TRUTH = [{"start": 2000, "end": 2000, "type": "ABRUPT"},
          {"start": 5000, "end": 7000, "type": "GRADUAL"}]
 
 
-def _write_run(root, seed, alarms, method="single_SEED", mode="MIXED"):
+def _write_run(root, seed, alarms, method="single_SEED_GRADUAL",
+               mode="MIXED"):
     d = root / f"SEA,{mode},{seed},{method}"
     d.mkdir(parents=True)
     (d / "alarms.json").write_text(json.dumps({"alarms": alarms}))
@@ -140,12 +164,16 @@ def _write_run(root, seed, alarms, method="single_SEED", mode="MIXED"):
     (d / "meta.json").write_text(json.dumps(meta))
 
 
+SEED1_TF2 = tf2(2 / 3, 1.0 * (1 - 0.3))
+SEED2_TF2 = tf2(1.0, 0.5 * (1 - 0.6))
+
+
 @pytest.fixture
 def runs(tmp_path):
     # seed 1: both drifts detected (delays 100 and 1000) + one FP at 9000
-    #         -> P 2/3, R 1, F1 0.8
+    #         -> P 2/3, R 1, NDT (100/500 + 1000/2500) / 2 = 0.3
     # seed 2: abrupt drift detected (delay 300), gradual missed
-    #         -> P 1, R 0.5, F1 2/3
+    #         -> P 1, R 0.5, NDT 300/500 = 0.6
     _write_run(tmp_path, 1, [2100, 6000, 9000])
     _write_run(tmp_path, 2, [2300])
     return load_runs(tmp_path)
@@ -155,7 +183,9 @@ def test_run_table(runs):
     df = stats.run_table(runs).set_index("seed")
     assert df.loc[1, ["tp", "fp", "fn"]].tolist() == [2, 1, 0]
     assert df.loc[1, "precision"] == pytest.approx(2 / 3)
-    assert df.loc[1, "f1"] == pytest.approx(0.8)
+    assert df.loc[1, "ndt"] == pytest.approx(0.3)
+    assert df.loc[1, "tf2"] == pytest.approx(SEED1_TF2)
+    assert df.loc[2, "tf2"] == pytest.approx(SEED2_TF2)
     assert df.loc[2, ["tp", "fp", "fn"]].tolist() == [1, 0, 1]
     assert df.loc[2, "recall"] == pytest.approx(0.5)
 
@@ -171,11 +201,12 @@ def test_method_summary_means_and_median_delay(runs):
     assert len(s) == 1
     row = s.iloc[0]
     assert (row["mode"], row["method"], row["n_runs"]) == (
-        "MIXED", "single_SEED", 2)
+        "MIXED", "single_SEED_GRADUAL", 2)
     assert (row["tp"], row["fp"], row["fn"]) == (3, 1, 1)
     assert row["precision_mean"] == pytest.approx((2 / 3 + 1) / 2)
     assert row["recall_mean"] == pytest.approx(0.75)
-    assert row["f1_mean"] == pytest.approx((0.8 + 2 / 3) / 2)
+    assert row["tf2_mean"] == pytest.approx((SEED1_TF2 + SEED2_TF2) / 2)
+    assert row["ndt_mean"] == pytest.approx((0.3 + 0.6) / 2)
     # sample std of two values a, b is |a - b| / sqrt(2)
     assert row["recall_std"] == pytest.approx(0.5 / 2 ** 0.5)
     assert row["n_detected"] == 3
@@ -183,14 +214,14 @@ def test_method_summary_means_and_median_delay(runs):
 
 
 def test_mean_differs_from_median_on_a_failed_generator(tmp_path):
-    # 3 runs, one failing (F1 0): the mean counts the failure, a median
-    # of [0, 0.8, 0.8] would not.
+    # 3 runs, one failing (TF2 0): the mean counts the failure, a median
+    # would not.
     for seed, alarms in [(1, [2100, 6000, 9000]), (2, [2100, 6000, 9000]),
                          (3, [])]:
         _write_run(tmp_path, seed, alarms)
     runs = load_runs(tmp_path)
     s = stats.method_summary(stats.run_table(runs), stats.delay_table(runs))
-    assert s.iloc[0]["f1_mean"] == pytest.approx(1.6 / 3)
+    assert s.iloc[0]["tf2_mean"] == pytest.approx(2 * SEED1_TF2 / 3)
 
 
 def test_delay_curve_zero_and_full_window(runs):
@@ -221,14 +252,16 @@ def test_per_type_mixed_splits_abrupt_and_gradual(runs):
 
 
 def test_first_to_fire_and_diversity(tmp_path):
-    _write_run(tmp_path, 1, [2100, 6000], method="single_SEED")
-    _write_run(tmp_path, 1, [2050], method="single_STEPD")
+    _write_run(tmp_path, 1, [2100, 6000], method="single_SEED_GRADUAL")
+    _write_run(tmp_path, 1, [2050], method="single_STEPD_ABRUPT")
     runs = load_runs(tmp_path)
     first = stats.first_to_fire(runs).set_index("drift_type")
-    assert first.loc["ABRUPT", "detector"] == "STEPD"  # 2050 < 2100
-    assert first.loc["GRADUAL", "detector"] == "SEED"  # STEPD missed it
+    assert first.loc["ABRUPT", "member"] == "STEPD_ABRUPT"  # 2050 < 2100
+    assert first.loc["ABRUPT", "cluster"] == "ABRUPT"
+    assert first.loc["GRADUAL", "member"] == "SEED_GRADUAL"  # STEPD missed
     div = stats.diversity(runs).iloc[0]
-    assert (div["detector_a"], div["detector_b"]) == ("STEPD", "SEED")
+    assert (div["member_a"], div["member_b"]) == ("STEPD_ABRUPT",
+                                                  "SEED_GRADUAL")
     assert (div["n11"], div["n01"], div["n10"], div["n00"]) == (1, 1, 0, 0)
     assert div["disagreement"] == 0.5
 
@@ -238,9 +271,10 @@ def test_significance_pairs_each_ensemble_with_each_single(tmp_path):
         _write_run(tmp_path, seed, [2100, 6000], method="ens_raw_resetall")
         _write_run(tmp_path, seed, [2100, 6000, 9000])
     sig = stats.significance(stats.run_table(load_runs(tmp_path)))
-    row = sig.set_index("comparison").loc["ens_raw_resetall_vs_single_SEED"]
+    row = sig.set_index("comparison").loc[
+        "ens_raw_resetall_vs_single_SEED_GRADUAL"]
     assert row["n_pairs"] == 6
-    assert row["mean_diff"] == pytest.approx(1.0 - 0.8)
+    assert row["mean_diff"] == pytest.approx(tf2(1.0, 0.7) - SEED1_TF2)
     assert row["p_value"] < 0.05
 
 
@@ -248,19 +282,19 @@ def test_sensitivity_summary_and_runtime(tmp_path):
     _write_run(tmp_path, 1, [2100], method="ens_cluster_sens")
     meta_path = tmp_path / "SEA,MIXED,1,ens_cluster_sens" / "meta.json"
     meta = json.loads(meta_path.read_text())
-    meta["final_levels"] = {"SEED": 2.0}
+    meta["final_levels"] = {"SEED_GRADUAL": 2.0, "RDDM_ABRUPT": 0.0}
     meta_path.write_text(json.dumps(meta))
     runs = load_runs(tmp_path)
-    s = stats.sensitivity_summary(runs).set_index("detector")
-    assert s.loc["SEED", "mean_final_level"] == 2.0
-    assert s.loc["RDDM", "mean_final_level"] == 0.0
+    s = stats.sensitivity_summary(runs).set_index("member")
+    assert s.loc["SEED_GRADUAL", "mean_final_level"] == 2.0
+    assert s.loc["RDDM_ABRUPT", "mean_final_level"] == 0.0
     rt = stats.runtime(runs).iloc[0]
     assert (rt["method"], rt["n_runs"]) == ("ens_cluster_sens", 1)
 
 
 def test_tuning_heatmaps(tmp_path):
     rows = [{"detector": "RDDM", "mode": "ABRUPT", "generator": "SEA",
-             "seed": 1, "f1": 0.5,
+             "seed": 1, "tf2": 0.5,
              "params": json.dumps({"min_n_instances": n,
                                    "drift_level": lvl})}
             for n in (100, 500) for lvl in (1.5, 2.0)]
@@ -293,6 +327,17 @@ def test_run_statistics_writes_every_file(tmp_path, monkeypatch):
     assert "ABRUPT/singles.png" not in names
     assert "MIXED/ensembles.png" not in names
     assert not (out / "GRADUAL").exists()  # no runs of that mode
+
+
+def test_roster_order_and_stale_runs(tmp_path):
+    assert stats.roster(["ens_cluster_vote", "single_RDDM_GRADUAL",
+                         "ens_raw_resetall", "single_RDDM_ABRUPT",
+                         "single_HDDMWeighted_GRADUAL"]) == [
+        "single_RDDM_ABRUPT", "single_HDDMWeighted_GRADUAL",
+        "single_RDDM_GRADUAL", "ens_raw_resetall", "ens_cluster_vote"]
+    _write_run(tmp_path, 1, [2100])  # meta without selected_params
+    assert len(load_runs(tmp_path)) == 1
+    assert load_runs(tmp_path, {"clusters": {}}) == []  # stale
 
 
 def test_run_statistics_without_runs(tmp_path):

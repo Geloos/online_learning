@@ -10,11 +10,7 @@ import json
 import numpy as np
 
 from drift_ensemble.detectors import reset_detector
-from drift_ensemble.runs import (
-    build_detector,
-    build_method_ensemble,
-    method_params,
-)
+from drift_ensemble.runs import build_detector, build_method_ensemble, methods
 from ensemble_experiment import config
 
 
@@ -124,30 +120,22 @@ class EnsembleFactory:
 #
 # A signal exposes ``update(t, err) -> bool`` (True = drift alarm at t),
 # ``reset()`` and the logs ``alarms``, ``raw_fires`` and ``logs``. The
-# detectors run with the params tuned for their cluster, exactly as in the
-# detector study: tuning phase 1 (selected_params.json) for the singles and
-# ens_raw_resetall, phase 2 (cluster_params.json: re-tuned params behind the
-# cluster's shared minimum) for the two-vote methods.
+# detectors run with the params tuned for their cluster
+# (selected_params.json), exactly as in the detector study.
 #
 # reset() wipes every detector's statistics (and pending cluster votes) but
 # keeps what an ensemble has learned about its detectors: cluster_vote
 # weights and cluster_sens sensitivity levels survive a DDD reset.
 # ===========================================================================
-def _load(path, step: str) -> dict:
+def load_params() -> dict:
+    """The tuned detector params (selected_params.json), the same for
+    every method."""
+    path = config.SELECTED_PARAMS_PATH
     if not path.exists():
         raise FileNotFoundError(
             f"{path} not found — run the drift-ensemble experiment's "
-            f"`python main.py {step}` first")
+            f"`python main.py select` first")
     return json.loads(path.read_text())
-
-
-def load_method_params(method: str) -> dict:
-    """The tuned params ``method`` runs with: phase 2 for the two-vote
-    methods, phase 1 for the singles and ens_raw_resetall. Only the file
-    the method needs is read."""
-    if method_params(method, "phase1", "phase2") == "phase2":
-        return _load(config.CLUSTER_PARAMS_PATH, "phase2")
-    return _load(config.SELECTED_PARAMS_PATH, "select")
 
 
 class SingleSignal:
@@ -210,9 +198,9 @@ class EnsembleSignal:
 
 
 def make_signal(method: str, selected_params: dict):
-    if method not in config.METHODS:
+    if method not in methods(selected_params):
         raise ValueError(f"unknown detection method: {method!r}")
     if method.startswith("single_"):
-        name = method[len("single_"):]
-        return SingleSignal(name, build_detector(name, selected_params))
+        member = method[len("single_"):]
+        return SingleSignal(member, build_detector(member, selected_params))
     return EnsembleSignal(build_method_ensemble(method, selected_params))

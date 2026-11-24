@@ -14,5 +14,7 @@ results/results_drift_ensemble/screening/
 # Outputs of the extended-DDD experiment.
 results/results_ensemble/
 
-# Downloaded real datasets (`python main.py real`).
-data/
+# data/ (the real datasets as ARFF) IS committed, except zips: the USP
+# Data Stream Repository zip (572 MiB, over GitHub's 100 MB file limit) is
+# no longer needed, its datasets are committed as ARFF.
+data/*.zip

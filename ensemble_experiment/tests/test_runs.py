@@ -66,13 +66,14 @@ def test_recurring_widths_half_half_and_same_layout_as_mixed():
     assert p["length"] == pos + SIZES["drift_every_n"]
 
 
-def test_stagger_uses_all_three_functions_as_concepts():
-    assert sorted(plan("STAGGER", "RECURRING", 201)["concepts"]) == [1, 2, 3]
+def test_recurring_concepts_are_distinct_functions():
+    concepts = plan("Sine", "RECURRING", 201)["concepts"]
+    assert len(set(concepts)) == 3 and set(concepts) <= {1, 2, 3, 4}
 
 
 def test_recurring_needs_a_valid_concept_count():
     with pytest.raises(ValueError):
-        plan("STAGGER", "RECURRING", 1, n_concepts=4)
+        plan("Sine", "RECURRING", 1, n_concepts=5)
     with pytest.raises(ValueError):
         plan("SEA", "RECURRING", 1, n_concepts=None)
 
@@ -103,11 +104,14 @@ def test_pure_modes_ignore_n_concepts():
 
 
 def test_run_specs_grid_and_seed_disjointness():
-    specs = run_specs()
+    from drift_ensemble import config as base
+
+    specs = run_specs(methods=["single_x", "ens_raw_resetall"])
     assert len(specs) == (len(config.GENERATORS) * len(config.MODES)
-                          * len(config.SEEDS) * len(config.METHODS))
+                          * len(config.SEEDS) * 2)
     assert len(set(specs)) == len(specs)
-    assert "ens_raw" not in config.METHODS
+    assert "ens_raw" not in base.ENSEMBLE_METHODS
+    assert "RECURRING" in config.MODES  # DDD keeps RECURRING
 
 
 def test_matching_windows_do_not_overlap_on_experiment_streams():
@@ -124,16 +128,16 @@ def test_matching_windows_do_not_overlap_on_experiment_streams():
 #
 # Integration tests that need capymoa and a JVM.
 # ===========================================================================
-def _cluster_params(m=200):
-    """A fixed cluster_params.json-style dict (capymoa defaults, shared
-    minimum m), so these tests don't depend on a tuning run."""
+def _params():
+    """A fixed selected_params.json-style dict (capymoa defaults), so
+    these tests don't depend on a tuning run. HDDMWeighted is in both
+    clusters, as the TF2 rule allows."""
     from drift_ensemble import config as base
 
-    out = {"min_instances": {c: m for c in base.CLUSTER_MEMBERS}}
-    for c, members in base.CLUSTER_MEMBERS.items():
-        out[c] = {n: dict(base.DEFAULT_PARAMS[n]) for n in members}
-        if "RDDM" in out[c]:
-            out[c]["RDDM"]["min_n_instances"] = m
+    out = {c: {n: dict(base.DEFAULT_PARAMS[n]) for n in base.DETECTOR_ORDER}
+           for c in base.PURE_MODES}
+    out["clusters"] = {"ABRUPT": ["HDDMWeighted", "RDDM"],
+                       "GRADUAL": ["SEED", "HDDMWeighted"]}
     return out
 
 
@@ -198,24 +202,15 @@ def test_ensemble_predicts_after_learning_and_is_reproducible():
     assert run() == preds
 
 
-def _phase1_params():
-    """A fixed selected_params.json-style dict (no shared minimum)."""
-    p = _cluster_params()
-    del p["min_instances"]
-    return p
-
-
 # (not ens_raw_resetall: STEPD with capymoa's default params fires every
 # 60 instances on an all-zero error stream, a MOA STEPD edge case)
-@pytest.mark.parametrize("method", ["single_HDDMWeighted",
+@pytest.mark.parametrize("method", ["single_HDDMWeighted_ABRUPT",
                                     "ens_cluster_sens"])
 @pytest.mark.jvm
 def test_signal_fires_and_resets(method):
-    from drift_ensemble.runs import method_params
     from ensemble_experiment.models import make_signal
 
-    sig = make_signal(method, method_params(method, _phase1_params(),
-                                            _cluster_params()))
+    sig = make_signal(method, _params())
     errs = [0] * 3000 + [1] * 1000
     fired = [t for t, e in enumerate(errs) if sig.update(t, e)]
     assert fired, "no alarm on a 0 -> 1 error jump"
@@ -230,7 +225,7 @@ def test_smoke_run_writes_all_files(tmp_path):
     from ensemble_experiment.runs import run_one
 
     out = run_one("Agrawal", "RECURRING", 201, "ens_cluster_sens",
-                  selected_params=_cluster_params(),
+                  selected_params=_params(),
                   overrides={"n_drifts": 2, "drift_every_n": 1000,
                              "gradual_width": 200},
                   out_root=tmp_path, min_training_size=300, log_every=50)
@@ -242,7 +237,7 @@ def test_smoke_run_writes_all_files(tmp_path):
     assert 0.0 <= s["acc"] <= 1.0
     assert meta["length"] == 3200
     assert len(np.load(out / "correct.npy")) == 3200
-    assert meta["detector_params"] == _cluster_params()
+    assert meta["detector_params"] == _params()
     # re-run is skipped (resumable)
     mtime = (out / "meta.json").stat().st_mtime
     run_one("Agrawal", "RECURRING", 201, "ens_cluster_sens",
@@ -252,15 +247,13 @@ def test_smoke_run_writes_all_files(tmp_path):
     assert (out / "meta.json").stat().st_mtime == mtime
 
 
-def test_each_method_reads_only_its_own_params_file(tmp_path, monkeypatch):
+def test_load_params_reads_selected_params(tmp_path, monkeypatch):
     from ensemble_experiment import config, models
 
-    phase1 = tmp_path / "selected_params.json"
-    phase1.write_text('{"phase": 1}')
-    monkeypatch.setattr(config, "SELECTED_PARAMS_PATH", phase1)
-    monkeypatch.setattr(config, "CLUSTER_PARAMS_PATH",
-                        tmp_path / "cluster_params.json")  # not there
-    assert models.load_method_params("ens_raw_resetall") == {"phase": 1}
-    assert models.load_method_params("single_SEED") == {"phase": 1}
-    with pytest.raises(FileNotFoundError, match="phase2"):
-        models.load_method_params("ens_cluster_vote")
+    path = tmp_path / "selected_params.json"
+    monkeypatch.setattr(config, "SELECTED_PARAMS_PATH", path)
+    with pytest.raises(FileNotFoundError, match="select"):
+        models.load_params()
+    path.write_text('{"ABRUPT": {}}')
+    assert models.load_params() == {"ABRUPT": {}}
+

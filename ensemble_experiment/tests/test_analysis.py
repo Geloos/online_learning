@@ -224,9 +224,12 @@ def test_statistics_table_and_files(tmp_path):
 
 
 def test_every_real_dataset_is_fully_specified():
-    assert set(config.REAL_DATASETS) == {"Electricity", "Airlines",
-                                         "Covtype", "Poker"}
+    assert set(config.REAL_DATASETS) == {
+        "Electricity", "Airlines", "Covtype", "Poker",  # OpenML
+        "INSECTS_abrupt", "INSECTS_gradual", "INSECTS_incr_reoccurring",
+        "NOAA", "Rialto", "GasSensor", "Posture"}  # USP, in data/
     for name, spec in config.REAL_DATASETS.items():
-        assert set(spec) == {"file", "length", "url", "md5", "acc_block"}
+        assert {"file", "length", "md5", "acc_block"} <= set(spec) <= {
+            "file", "length", "md5", "acc_block", "url"}
         assert spec["length"] > config.MIN_TRAINING_SIZE
         assert len(spec["md5"]) == 32

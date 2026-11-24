@@ -1,8 +1,7 @@
 """Detectors and the ensembles built from them.
 
   * detectors  factory, tuning grids, cached-error replay, mid-stream
-               threshold control, the cluster's shared-minimum gate
-               (GatedDetector, tuning phase 2)
+               threshold control
   * ensembles  RawResetAllEnsemble, ClusterVoteEnsemble,
                ClusterSensitivityEnsemble (duck-typed detectors, so they
                are unit-testable without a JVM)
@@ -10,7 +9,10 @@
 
 from __future__ import annotations
 
+import collections
+import functools
 import itertools
+import math
 
 import numpy as np
 
@@ -35,8 +37,108 @@ from drift_ensemble import config
 #     DDM(min_n_instances, out_control_level, ...)
 #     HDDMAverage(drift_confidence, test_type, ...)
 #     ADWIN(delta)
+#     KSWIN(alpha, window_size, stat_size)   our own class, below
 # ===========================================================================
 DETECTOR_NAMES = list(config.TUNING_GRIDS)
+
+
+def ks_pvalue_equal_sizes(n: int, k: int) -> float:
+    """Exact two-sided p-value P(D >= k/n) of the two-sample KS test with
+    two samples of size n (Gnedenko-Korolyuk formula; equals scipy's
+    ks_2samp(method="exact"), which fails for some n, e.g. k=1 at n=30)."""
+    s = sum((-1) ** (j + 1) * math.comb(2 * n, n - j * k)
+            for j in range(1, n // k + 1))
+    return min(1.0, 2 * s / math.comb(2 * n, n))
+
+
+@functools.lru_cache(maxsize=None)
+def ks_critical_count(stat_size: int, alpha: float) -> int:
+    """Smallest difference in the number of 1s between two 0/1 samples of
+    size ``stat_size`` at which their two-sample KS test has p <= alpha.
+    With 0/1 data the KS statistic is |k1 - k2| / stat_size, and p falls
+    as it grows. stat_size + 1 = never."""
+    for d in range(1, stat_size + 1):
+        if ks_pvalue_equal_sizes(stat_size, d) <= alpha:
+            return d
+    return stat_size + 1
+
+
+class KSWIN:
+    """KSWIN, Kolmogorov-Smirnov WINdowing (Raab, Heusinger & Schleif
+    2020), written from the paper for a 0/1 error stream. Not in capymoa
+    0.9.0 or MOA; screening only.
+
+    Keeps the last ``window_size`` inputs. Once the window is full, each
+    new input runs a two-sample KS test between the newest ``stat_size``
+    inputs and ``stat_size`` inputs drawn uniformly, without replacement,
+    from the older ``window_size - stat_size``. p <= alpha is a drift.
+    After a drift only the newest ``stat_size`` inputs are kept, so the
+    next test comes ``window_size - stat_size`` inputs later (it resets
+    itself, like the capymoa detectors).
+
+    With 0/1 inputs the KS statistic only depends on the number of 1s in
+    each sample, and the number of 1s in the random sample is
+    hypergeometric. So one hypergeometric draw replaces drawing
+    ``stat_size`` positions: the same distribution, much faster.
+    ``seed`` fixes the draws, so a replay is deterministic. (scikit-multiflow
+    and River also require a KS statistic > 0.1; at these sample sizes and
+    alphas the critical value is already larger, so it changes nothing.)
+    """
+
+    def __init__(self, alpha: float = 0.005, window_size: int = 100,
+                 stat_size: int = 30, seed: int = 0):
+        if not 0 < 2 * stat_size <= window_size:
+            raise ValueError("KSWIN needs 0 < 2 * stat_size <= window_size")
+        self.alpha = float(alpha)
+        self.window_size = int(window_size)
+        self.stat_size = int(stat_size)
+        self.seed = seed
+        self.d_crit = ks_critical_count(self.stat_size, self.alpha)
+        self.reset()
+
+    def reset(self) -> None:
+        self._rng = np.random.default_rng(self.seed)
+        self._window: collections.deque[int] = collections.deque()
+        self._ones = 0  # 1s in the window
+        self._recent_ones = 0  # 1s in its newest stat_size inputs
+        self._drift = False
+
+    def add_element(self, x: float) -> None:
+        if x != 0 and x != 1:
+            raise ValueError(f"KSWIN takes 0/1 inputs only, got {x}")
+        x = int(x)
+        w, r = self._window, self.stat_size
+        w.append(x)
+        self._ones += x
+        self._recent_ones += x
+        if len(w) > r:
+            self._recent_ones -= w[-r - 1]  # just left the newest part
+        if len(w) > self.window_size:
+            self._ones -= w.popleft()
+        self._drift = False
+        if len(w) < self.window_size:
+            return
+        n_old = self.window_size - r
+        old_ones = self._ones - self._recent_ones
+        if 0 < old_ones < n_old:
+            k = int(self._rng.hypergeometric(old_ones, n_old - old_ones, r))
+        else:  # all 0s or all 1s: the sample is fixed
+            k = r if old_ones else 0
+        if abs(k - self._recent_ones) >= self.d_crit:
+            self._drift = True
+            self._window = collections.deque(itertools.islice(w, n_old,
+                                                              None))
+            self._ones = self._recent_ones
+
+    def detected_change(self) -> bool:
+        return self._drift
+
+
+def valid_config(name: str, params: dict) -> bool:
+    """False for grid combos a detector can't run with."""
+    if name == "KSWIN":
+        return 2 * params["stat_size"] <= params["window_size"]
+    return True
 
 
 def _detector_classes():
@@ -58,6 +160,7 @@ def _detector_classes():
         "DDM": DDM,
         "HDDMAverage": HDDMAverage,
         "ADWIN": ADWIN,
+        "KSWIN": KSWIN,
     }
 
 
@@ -79,6 +182,7 @@ def iter_configs(name: str, grid: dict | None = None) -> list[dict]:
     keys = list(grid)
     combos = [dict(zip(keys, values))
               for values in itertools.product(*(grid[k] for k in keys))]
+    combos = [c for c in combos if valid_config(name, c)]
     if name == "SEED" and len(combos) > config.SEED_RANDOM_CONFIGS:
         rng = np.random.default_rng(config.GRID_SAMPLE_SEED)
         idx = rng.choice(len(combos), size=config.SEED_RANDOM_CONFIGS,
@@ -162,83 +266,10 @@ def set_threshold(det, name: str, value: float) -> None:
     field.setDouble(owner, float(value))
 
 
-# ---------------------------------------------------------------------------
-# Tuning phase 2: the cluster's shared minimum (config.MIN_INSTANCES_GRID)
-# ---------------------------------------------------------------------------
-def own_minimum(name: str, params: dict) -> int:
-    """Instances a detector needs after a reset before it can fire at all,
-    set by its own params (probe 2026-11-23: 0s then 1s right after
-    ensemble.reset_detector). HDDMWeighted has no explicit minimum."""
-    if name == "STEPD":
-        return 2 * int(params["window_size"])
-    if name == "SEED":
-        return 2 * int(params["block_size"])
-    if name == "RDDM":
-        return int(params["min_n_instances"])
-    return 0
-
-
-class GatedDetector:
-    """A detector whose fires are ignored until it has seen
-    ``min_instances`` instances since its last reset or its last accepted
-    fire (the cluster's shared minimum). The wrapped detector keeps
-    updating meanwhile; a fire it raises inside the gate is dropped (its
-    own self-reset still happens inside MOA). ``moa_detector`` is passed
-    through, so reset_detector and set_threshold work unchanged."""
-
-    def __init__(self, detector, min_instances: int):
-        self.detector = detector
-        self.min_instances = int(min_instances)
-        self.n_seen = 0  # instances since the last reset / accepted fire
-        self._fired = False
-
-    @property
-    def moa_detector(self):
-        return self.detector.moa_detector
-
-    def add_element(self, element: float) -> None:
-        self.detector.add_element(element)
-        self.n_seen += 1
-        self._fired = (self.detector.detected_change()
-                       and self.n_seen >= self.min_instances)
-        if self._fired:
-            self.n_seen = 0
-
-    def detected_change(self) -> bool:
-        return self._fired
-
-    def reset(self) -> None:
-        self.detector.reset()
-        self.n_seen = 0
-        self._fired = False
-
-
-def gate_alarms(alarms, errors, min_instances: int) -> list[int]:
-    """The alarms a GatedDetector would keep, computed from the ungated
-    alarms of a replay WITHOUT explicit resets (single detector on cached
-    errors). Exact there: the wrapped detector sees the same input either
-    way, so only the gate's bookkeeping differs. ``errors`` < 0 (warm-up)
-    are not fed to the detector and do not count."""
-    if min_instances <= 0:
-        return list(alarms)
-    fed = np.cumsum(np.asarray(errors) >= 0)  # instances fed up to t
-    kept: list[int] = []
-    last = 0
-    for t in alarms:
-        if fed[t] - last >= min_instances:
-            kept.append(int(t))
-            last = int(fed[t])
-    return kept
-
-
-def run_detector_on_errors(name: str, params: dict, errors,
-                           min_instances: int = 0) -> list[int]:
+def run_detector_on_errors(name: str, params: dict, errors) -> list[int]:
     """Feed a cached 0/1 error sequence (entries < 0 are the warm-up period
-    and are skipped) to a fresh detector; return the alarm indices. With
-    ``min_instances`` > 0 the detector is gated (GatedDetector)."""
+    and are skipped) to a fresh detector; return the alarm indices."""
     det = make_detector(name, params)
-    if min_instances > 0:
-        det = GatedDetector(det, min_instances)
     alarms: list[int] = []
     for t, e in enumerate(errors):
         if e < 0:

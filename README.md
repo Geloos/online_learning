@@ -32,8 +32,8 @@ Run everything:
 python main.py
 ```
 
-`main.py` runs the drift-ensemble pipeline (steps 1–6), then the DDD experiment (steps 7–8)
-and DDD on the real datasets (step 9). Each step runs as its own process, and the run stops
+`main.py` runs the drift-ensemble pipeline (steps 1–5), then the DDD experiment (steps 6–7)
+and DDD on the real datasets (step 8). Each step runs as its own process, and the run stops
 at the first failure. Every step is resumable, so a re-run only does the work that is
 missing. Without `--yes`, each long step prints a time estimate and asks for confirmation.
 
@@ -53,23 +53,22 @@ You can also run one step at a time: `python main.py STEP [--workers N] [--yes] 
 
 | # | Step | What it does | Options |
 |---|---|---|---|
-| 1 | `cache` | cache the tree errors of the 18 tuning streams | |
-| 2 | `tune` | tuning phase 1: every grid config on the tuning streams | `--limit N` |
-| 3 | `select` | tuning phase 1: best config per detector × mode | `--objective` |
-| 4 | `phase2` | tuning phase 2: each cluster's shared minimum | |
-| 5 | `test` | run the 7 methods on the 60 test streams | `--methods` |
-| 6 | `stats` | statistics of experiment 1 | |
-| 7 | `ddd` | extended DDD on the synthetic streams | `--generators`, `--modes`, `--seeds`, `--methods` |
-| 8 | `ddd-stats` | statistics of the DDD runs | |
-| 9 | `real` | DDD on the real datasets, and their statistics | `--datasets`, `--methods` |
-| – | `screen` | DDM, HDDMAverage and ADWIN screened against the 4 (not in the full run) | |
+| 1 | `cache` | cache the tree errors of the 102 tuning streams | |
+| 2 | `tune` | tuning: every grid config on the tuning streams | `--limit N` |
+| 3 | `select` | tuning: best config per detector × mode, and the clusters (both by TF2) | |
+| 4 | `test` | cache the 204 test streams, run the 7 methods on the 153 ABRUPT/GRADUAL/MIXED ones | `--methods` |
+| 5 | `stats` | statistics of experiment 1 | |
+| 6 | `ddd` | extended DDD on the synthetic streams | `--generators`, `--modes`, `--seeds`, `--methods` |
+| 7 | `ddd-stats` | statistics of the DDD runs | |
+| 8 | `real` | DDD on the real datasets, and their statistics | `--datasets`, `--methods` |
+| – | `screen` | DDM, HDDMAverage, ADWIN and KSWIN screened against the 4 (not in the full run) | |
 
 Tests: `python -m pytest` runs both suites. `python -m pytest -m "not jvm"` runs only the fast
 unit tests, which need no JVM.
 
 ## What runs
 
-**Streams (`streams.py`).** The generators are SEA, Agrawal and STAGGER. A drift changes the
+**Streams (`streams.py`).** The generators are SEA, Agrawal and Sine. A drift changes the
 classification function. The seed fixes the whole stream.
 
 | Mode | Drifts |
@@ -85,46 +84,48 @@ classification function. The seed fixes the whole stream.
 - **Caching:** the tree's 0/1 error sequence is computed once per stream and cached. Every
   detector configuration replays it.
 - **Steps:**
-  1. Cache the 18 tuning streams.
-  2. Tuning phase 1: tune each detector's grid on them, and pick the best config separately
-     for ABRUPT and for GRADUAL.
-  3. Split the detectors into two clusters: ABRUPT = HDDMWeighted + RDDM,
-     GRADUAL = STEPD + SEED. Each detector goes where its cluster's params hurt it least on
-     the other stream type.
-  4. Tuning phase 2: give each cluster one minimum M. After a reset, neither detector of the
-     cluster may fire before M instances, so both switch back on together. For each M
-     (50–2000), the cluster's two detectors are re-tuned on their mode's tuning streams, and
-     the M with the best mean F1 of the two wins. The ABRUPT and GRADUAL clusters get their
-     own M. Only the two methods that need two votes (`ens_cluster_vote`,
-     `ens_cluster_sens`) use phase 2. The singles and `ens_raw_resetall` use phase 1.
-  5. Run 7 methods on 60 test streams: 3 generators × 4 modes × 5 seeds. RECURRING uses the
-     same tuned params as MIXED.
-  6. Score them.
+  1. Cache the 102 tuning streams: 3 generators × ABRUPT/GRADUAL × 17 seeds (1–17).
+  2. Tuning: tune each detector's grid on them, and pick its best config by TF2
+     (see Scoring) separately for ABRUPT and for GRADUAL.
+  3. Clusters: the 2 detectors with the best tuning TF2 on ABRUPT streams form the ABRUPT
+     cluster, the 2 best on GRADUAL streams the GRADUAL cluster. Each member runs with its
+     cluster's mode params, so one detector can be in both clusters with different params
+     (e.g. `HDDMWeighted_ABRUPT` and `HDDMWeighted_GRADUAL`).
+  4. Run 7 methods on 153 test streams: 3 generators × ABRUPT/GRADUAL/MIXED × 17 seeds
+     (101–117). The 51 RECURRING test streams are generated and cached, but not run.
+  5. Score them.
 - **Methods:**
 
 | Method | Alarm rule |
 |---|---|
-| `single_*` (×4) | the detector fires |
-| `ens_raw_resetall` | any detector fires; all 4 reset |
+| `single_<detector>_<cluster>` (×4, one per cluster member) | the member fires |
+| `ens_raw_resetall` | any member fires; all 4 reset |
 | `ens_cluster_vote` | both detectors of a cluster fire within 250 instances (or one full-weight detector); the faster voter gains weight |
 | `ens_cluster_sens` | same pair rule; the slower voter is made more sensitive (its threshold is changed mid-stream) |
 
 - **Scoring:** an alarm is a true positive if it falls in `[drift start, drift end + 500]`.
-  The metrics are precision, recall, F1, delay and false-alarm rate, with Wilcoxon tests on F1.
+  The one score is **TF2 (timely F2)**, which replaced F1:
+  - NDT (normalized detection time) of a detected drift = (detection − drift start) /
+    (drift end − drift start + 500), so 0 at the start and 1 at the end of its window;
+  - timely recall = recall × (1 − mean NDT): a late detection earns less, a miss earns 0;
+  - TF2 = 5 · P · R_t / (4 · P + R_t), the F2 of precision and timely recall (recall
+    counts twice as much, and precision still stops a detector that fires all the time).
+
   `statistics/drift_ensemble/` holds, for every method × mode:
-  - mean ± std of precision, recall, F1 and false-alarm rate over the runs, and the
+  - mean ± std of precision, recall, TF2, NDT and false-alarm rate over the runs, and the
     median delay;
   - recall as the allowed delay shrinks from 500 to 0;
   - bar charts per mode (singles and ensembles);
-  - Wilcoxon tests on F1, recall on abrupt vs gradual drifts in MIXED and RECURRING,
-    which detector fires first, how much the detectors agree, the sensitivity levels of
-    `ens_cluster_sens`, run times, and heatmaps of the tuning F1.
+  - Wilcoxon tests on TF2, recall on abrupt vs gradual drifts in MIXED, which member
+    fires first, how much the members agree, the sensitivity levels of
+    `ens_cluster_sens`, run times, and heatmaps of the tuning TF2.
 
 **Experiment 2: extended DDD.**
 - **Streams:** 3 generators × 4 modes × 10 seeds, with 8 drifts per stream, one every 5,000
   instances; gradual drifts are 1,000 wide.
-- **Drift signals:** 7 detection methods from experiment 1: the 4 singles,
-  `ens_raw_resetall`, `ens_cluster_vote` and `ens_cluster_sens`. This gives 840 runs.
+- **Drift signals:** the 7 detection methods of experiment 1, with the same tuning: the 4
+  cluster-member singles, `ens_raw_resetall`, `ens_cluster_vote` and `ens_cluster_sens`.
+  This gives 840 runs. DDD keeps its RECURRING streams.
 - **Learner:**
   - Each model is an online-bagging ensemble of 10 Hoeffding trees with Naive Bayes
     adaptive leaves.
@@ -132,11 +133,14 @@ classification function. The seed fixes the whole stream.
     recalled from the concept pool.
   - The after-drift phase ends when one ensemble clearly wins, or when the adaptive cap for
     that drift kind runs out.
-- **Real data:** DDD with `ens_raw_resetall` on Electricity, Airlines, Covtype and Poker
-  (OpenML, MOA versions), one run each, next to a no-change baseline.
+- **Real data:** DDD with `ens_raw_resetall`, one run per dataset, next to a no-change
+  baseline:
+  - from OpenML (MOA versions): Electricity, Airlines, Covtype and Poker;
+  - from the USP Data Stream Repository (Souza et al.): INSECTS abrupt, gradual and
+    incremental-reoccurring (balanced), NOAA, Rialto, GasSensor and Posture.
 - **Measured:**
   - prequential accuracy
-  - detection F1 and delay
+  - detection TF2, NDT and delay
   - how each after-drift phase ended
   - fast/slow classification accuracy
   - how often a recalled concept matches the true one
@@ -150,9 +154,9 @@ main.py                every step of both experiments (the only entry point)
 streams.py             shared stream generator (all 4 modes)
 drift_ensemble/        experiment 1
   config.py            every setting of the experiment (also sets JAVA_HOME)
-  detectors.py         detectors (factory, grids, thresholds, phase-2 gate) and the
+  detectors.py         detectors (factory, grids, thresholds) and the
                        reset-all / cluster-vote / cluster-sens ensembles
-  tuning.py            tuning phase 1 and 2, detector screening
+  tuning.py            tuning, detector screening
   runs.py              tree-error cache, one method on one test stream, result folders
   stats.py             alarm <-> drift scoring, every statistic (reads result folders
                        only)
@@ -178,9 +182,9 @@ statistics/
 ```
 
 Only `results/results_drift_ensemble/tuning/` is in git. It holds the tuned detector
-parameters: `selected_params.json` (phase 1) and `cluster_params.json` (phase 2), which
-both experiments read. Everything else under `results/` is regenerated by `main.py`. The
-real datasets are downloaded from OpenML into `data/` (not in git) on first use.
+parameters: `selected_params.json`, which both experiments read. Everything else under
+`results/` is regenerated by `main.py`. The real datasets are committed as ARFF files in
+`data/` (the OpenML ones would also be downloaded again if missing).
 
 ## capymoa 0.9.0 notes
 

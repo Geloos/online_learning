@@ -17,12 +17,9 @@ RESULTS_DIR = base.PROJECT_ROOT / "results" / "results_ensemble"  # run outcomes
 RUNS_DIR = RESULTS_DIR / "runs"
 # Statistics computed from the runs (analysis.py) live outside results/.
 ANALYSIS_DIR = base.PROJECT_ROOT / "statistics" / "ensemble_experiment"
-# Detector params tuned by the drift-ensemble experiment. Phase 1
-# (`python main.py select`) for the singles and ens_raw_resetall; phase 2
-# (`python main.py phase2`: the cluster's shared minimum + re-tuned
-# params) for the two-vote methods (base.PHASE2_METHODS).
+# Detector params tuned by the drift-ensemble experiment
+# (`python main.py select`), used by every method.
 SELECTED_PARAMS_PATH = base.TUNING_DIR / "selected_params.json"
-CLUSTER_PARAMS_PATH = base.CLUSTER_PARAMS_PATH
 
 # ---------------------------------------------------------------------------
 # Extended DDD (Minku & Yao 2011 + drift-type-aware adaptive cap + pool)
@@ -71,19 +68,12 @@ assert not set(SEEDS) & set(base.TEST_SEEDS), "seeds overlap test seeds"
 
 # ---------------------------------------------------------------------------
 # Detection: the error stream of DDD's new-low ensemble is watched by one of
-# the detector study's 7 methods. There is no ens_raw: DDD resets the whole
-# signal on every alarm (the watched model is replaced), which would make it
-# identical to ens_raw_resetall (it was dropped from experiment 1 too).
+# the detector study's 7 methods (drift_ensemble.runs.methods of
+# selected_params.json: one single per cluster member + the 3 ensembles).
+# There is no ens_raw: DDD resets the whole signal on every alarm (the
+# watched model is replaced), which would make it identical to
+# ens_raw_resetall (it was dropped from experiment 1 too).
 # ---------------------------------------------------------------------------
-METHODS = [
-    "single_STEPD",
-    "single_SEED",
-    "single_HDDMWeighted",
-    "single_RDDM",
-    "ens_raw_resetall",
-    "ens_cluster_vote",
-    "ens_cluster_sens",
-]
 MIN_TRAINING_SIZE = base.MIN_TRAINING_SIZE  # detector warm-up (instances)
 MAX_DELAY = base.MAX_DELAY  # alarm <-> drift matching window
 DUPLICATES_AS_FP = base.DUPLICATES_AS_FP
@@ -159,6 +149,64 @@ REAL_DATASETS = {
         "md5": "21773aa4931b1815ee7eaa7aaf4c7ac1",
         "acc_block": 5_000,
     },
+    # From the USP Data Stream Repository (Souza et al.), added 2026-11-24
+    # at the user's request. Its headerless CSVs (class last) were
+    # converted once to these ARFFs (numeric features a1..an, nominal
+    # class last), which are committed in data/; md5 = the ARFF's.
+    # INSECTS (Souza et al. 2020): 33 numeric features, 6 balanced
+    # classes, drifts caused by lab temperature changes (their positions
+    # are in the paper, not in the data).
+    "INSECTS_abrupt": {
+        "file": "insects_abrupt_balanced.arff",
+        "length": 52_848,
+        "md5": "09703fa858ee41ecebbb43d18cf1ced2",
+        "acc_block": 500,
+    },
+    "INSECTS_gradual": {
+        "file": "insects_gradual_balanced.arff",
+        "length": 24_150,
+        "md5": "56a737d88dd804551cb1d5d6265411b9",
+        "acc_block": 250,
+    },
+    "INSECTS_incr_reoccurring": {
+        "file": "insects_incremental_reoccurring_balanced.arff",
+        "length": 79_986,
+        "md5": "f0c19875bc9088688205320a07e56a0a",
+        "acc_block": 500,
+    },
+    # NOAA weather (rain yes/no, 8 features, 50 years of daily data).
+    "NOAA": {
+        "file": "noaa.arff",
+        "length": 18_159,
+        "md5": "43158974ed169303218357082736b98a",
+        "acc_block": 200,
+    },
+    # Rialto (10 Venice buildings from webcam images, 27 features; day /
+    # night light changes recur).
+    "Rialto": {
+        "file": "rialto.arff",
+        "length": 82_250,
+        "md5": "a9def96c517dd954809971fc803b008f",
+        "acc_block": 500,
+    },
+    # Gas sensor array drift (6 gases, 128 features, 36 months of sensor
+    # ageing, in time order).
+    "GasSensor": {
+        "file": "gas_sensor.arff",
+        "length": 13_910,
+        "md5": "01415d918926a2dc4872977372fd9cfb",
+        "acc_block": 200,
+    },
+    # Posture (11 activities from body sensors, 3 features). The original
+    # CSV had 164,859 lines, but one held two rows glued together (a
+    # missing line break after "standing up from lying"); it was split
+    # into two rows during the conversion.
+    "Posture": {
+        "file": "posture.arff",
+        "length": 164_860,
+        "md5": "44dc6285b3ad01fd43fda2dc02f65fff",
+        "acc_block": 1_000,
+    },
 }
 # The large datasets (540k-830k instances) need more JVM heap than the
 # synthetic runs: main.py runs the real step with these JVM args and at
@@ -179,8 +227,7 @@ def snapshot() -> dict:
         "MAX_DELAY": MAX_DELAY,
         "DUPLICATES_AS_FP": DUPLICATES_AS_FP,
         "INIT_FUNCTION": streams.INIT_FUNCTION,
-        "CLUSTER_MEMBERS": base.CLUSTER_MEMBERS,
-        "PHASE2_METHODS": base.PHASE2_METHODS,
+        "CLUSTER_SIZE": base.CLUSTER_SIZE,
         "DETECTOR_ORDER": base.DETECTOR_ORDER,
         "VOTE": base.VOTE,
         "SENS": base.SENS,

@@ -2,8 +2,8 @@
 
   * cache        one Hoeffding-tree pass per stream -> cached 0/1 errors +
                  ground truth; every detector config replays them
-  * workflow     which tuned params a method uses (phase 1 or 2), building
-                 its detectors, one method on one cached stream
+  * workflow     building a method's detectors with their tuned params,
+                 one method on one cached stream
   * run folders  saving a run (alarms.json, weights.csv, sensitivity.csv,
                  raw_fires.csv, meta.json last) and loading finished runs
 """
@@ -20,7 +20,6 @@ from drift_ensemble import config
 from drift_ensemble.detectors import (
     ClusterSensitivityEnsemble,
     ClusterVoteEnsemble,
-    GatedDetector,
     make_detector,
     RawResetAllEnsemble,
     run_detector_on_errors,
@@ -134,12 +133,15 @@ def load_cache(sid: str) -> tuple[np.ndarray, list[dict], dict]:
 #
 # Prequential test-run workflow.
 #
-# Every method runs on every test stream:
+# The members are the cluster members picked by the `select` step
+# (selected_params.json "clusters", config.CLUSTER_SIZE per mode by TF2),
+# named <detector>_<cluster>, e.g. HDDMWeighted_ABRUPT: the detector with
+# the params tuned for that cluster's mode. A detector in both clusters is
+# two members. Every method runs on every test stream:
 #
-#   single_STEPD / single_SEED / single_HDDMWeighted / single_RDDM
-#       one detector with its cluster's selected params; every raw fire is an
-#       alarm (replayed from the cached HT errors)
-#   ens_raw_resetall   OR of all 4; every alarm resets ALL detectors
+#   single_<member>    one member (4 singles); every raw fire is an alarm
+#                  (replayed from the cached HT errors)
+#   ens_raw_resetall   OR of the 4 members; every alarm resets ALL of them
 #                  ("drift detected, okay, reset")
 #   ens_cluster_vote   two votes from the same cluster within VOTE["WINDOW"]
 #                  instances (or one vote from a full-weight detector) signal
@@ -148,69 +150,65 @@ def load_cache(sid: str) -> tuple[np.ndarray, list[dict], dict]:
 #                  later voter of a pair becomes more sensitive (thresholds
 #                  are changed mid-stream, per cluster — see config.SENS)
 #
-# Every detector runs with its cluster's params. The singles and
-# ens_raw_resetall use tuning phase 1 (selected_params.json, no shared
-# minimum); the two-vote methods (config.PHASE2_METHODS) use phase 2
-# (cluster_params.json), where each detector also sits behind its cluster's
-# shared minimum (GatedDetector: no fire is accepted until M instances after
-# a reset or an accepted fire). method_params picks the file per method.
 #
 # The HT error sequence is deterministic given the stream, so methods read it
 # from the per-stream cache (tests/test_runs.py proves equality with a
 # live HT run).
 # ===========================================================================
-CLUSTER_OF = {
-    name: cluster
-    for cluster, members in config.CLUSTER_MEMBERS.items()
-    for name in members
-}
+def members(selected_params: dict) -> dict[str, tuple[str, str]]:
+    """member -> (detector, cluster), clusters in PURE_MODES order and
+    detectors in DETECTOR_ORDER within a cluster."""
+    clusters = selected_params["clusters"]
+    return {f"{det}_{cluster}": (det, cluster)
+            for cluster in config.PURE_MODES
+            for det in config.DETECTOR_ORDER if det in clusters[cluster]}
 
 
-def method_params(method: str, phase1: dict, phase2: dict) -> dict:
-    """The tuning a method runs with: phase 2 (cluster_params.json) for
-    the two-vote methods, phase 1 (selected_params.json) for the rest."""
-    return phase2 if method in config.PHASE2_METHODS else phase1
+def methods(selected_params: dict) -> list[str]:
+    """The 7-method roster: one single per member, then the ensembles."""
+    return ([f"single_{m}" for m in members(selected_params)]
+            + config.ENSEMBLE_METHODS)
 
 
-def params_for(name: str, selected_params: dict) -> dict:
-    """A detector always runs with the params tuned for its own cluster."""
-    return selected_params[CLUSTER_OF[name]][name]
+def split_member(member: str) -> tuple[str, str]:
+    """'HDDMWeighted_ABRUPT' -> ('HDDMWeighted', 'ABRUPT')."""
+    det, cluster = member.rsplit("_", 1)
+    return det, cluster
 
 
-def min_instances_for(name: str, selected_params: dict) -> int:
-    """The shared minimum of the detector's cluster (tuning phase 2,
-    cluster_params.json). 0 = no gate (a phase-1 selected_params dict)."""
-    return int(selected_params.get("min_instances", {})
-               .get(CLUSTER_OF[name], 0))
+def params_for(member: str, selected_params: dict) -> dict:
+    """A member runs with the params tuned for its cluster's mode."""
+    det, cluster = split_member(member)
+    return selected_params[cluster][det]
 
 
-def build_detector(name: str, selected_params: dict):
-    """One detector with its cluster's params, gated by its cluster's
-    shared minimum when there is one."""
-    det = make_detector(name, params_for(name, selected_params))
-    m = min_instances_for(name, selected_params)
-    return GatedDetector(det, m) if m > 0 else det
+def build_detector(member: str, selected_params: dict):
+    return make_detector(split_member(member)[0],
+                         params_for(member, selected_params))
 
 
 def build_detectors(selected_params: dict) -> dict:
-    return {name: build_detector(name, selected_params)
-            for name in config.DETECTOR_ORDER}
+    return {m: build_detector(m, selected_params)
+            for m in members(selected_params)}
 
 
 def build_method_ensemble(method: str, selected_params: dict):
     """Fresh error-driven detector ensemble for an ensemble method of the
     roster (ens_raw_resetall, ens_cluster_vote, ens_cluster_sens), wired
     with its config. Each object exposes update(t, err) and .alarms."""
+    cluster_of = {m: c for m, (_, c) in members(selected_params).items()}
+    detector_of = {m: d for m, (d, _) in members(selected_params).items()}
+    order = list(cluster_of)
     if method == "ens_raw_resetall":
         return RawResetAllEnsemble(
             detectors=build_detectors(selected_params),
-            order=config.DETECTOR_ORDER,
+            order=order,
         )
     if method == "ens_cluster_vote":
         return ClusterVoteEnsemble(
             detectors=build_detectors(selected_params),
-            clusters=dict(CLUSTER_OF),
-            order=config.DETECTOR_ORDER,
+            clusters=cluster_of,
+            order=order,
             window=config.VOTE["WINDOW"],
             w_init=config.VOTE["W_INIT"],
             w_max=config.VOTE["W_MAX"],
@@ -221,19 +219,20 @@ def build_method_ensemble(method: str, selected_params: dict):
         sens = config.SENS
         return ClusterSensitivityEnsemble(
             detectors=build_detectors(selected_params),
-            clusters=dict(CLUSTER_OF),
-            order=config.DETECTOR_ORDER,
+            clusters=cluster_of,
+            order=order,
             base_thresholds={
-                name: float(params_for(name, selected_params)[
-                    sens["SCALE"][name][0]])
-                for name in config.DETECTOR_ORDER
+                m: float(params_for(m, selected_params)[
+                    sens["SCALE"][detector_of[m]][0]])
+                for m in order
             },
             window=sens["WINDOW"],
             late_step=sens["LATE_STEP"],
             l_max=sens["L_MAX"],
-            threshold_fn=threshold_for_level,
-            apply_fn=lambda name, det, value: set_threshold(det, name,
-                                                            value),
+            threshold_fn=lambda m, base, level: threshold_for_level(
+                detector_of[m], base, level),
+            apply_fn=lambda m, det, value: set_threshold(
+                det, detector_of[m], value),
         )
     raise ValueError(f"not an error-driven ensemble method: {method!r}")
 
@@ -273,13 +272,12 @@ def run_method(method: str, generator: str, mode: str, seed: int,
     t0 = time.perf_counter()
 
     if method.startswith("single_"):
-        name = method[len("single_"):]
+        member = method[len("single_"):]
         alarms = run_detector_on_errors(
-            name, params_for(name, selected_params), errors,
-            min_instances_for(name, selected_params))
+            split_member(member)[0], params_for(member, selected_params),
+            errors)
         result = {"alarms": alarms}
-    elif method in ("ens_raw_resetall", "ens_cluster_vote",
-                    "ens_cluster_sens"):
+    elif method in config.ENSEMBLE_METHODS:
         ens = build_method_ensemble(method, selected_params)
         for t, e in enumerate(errors):
             if e >= 0:
@@ -368,56 +366,48 @@ def save_run(generator: str, mode: str, seed: int, method: str,
 
 
 def load_selected_params() -> dict:
-    """Phase-1 params (both modes, every detector; used by screening)."""
+    """Tuned params: {mode: {detector: params}} for both modes, plus
+    "clusters": {mode: [the CLUSTER_SIZE detectors picked by TF2]}."""
     path = config.TUNING_DIR / "selected_params.json"
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} not found — run tuning phase 1 first "
+            f"{path} not found — run tuning first "
             f"(`python main.py tune`, then `select`)")
-    return json.loads(path.read_text())
-
-
-def load_cluster_params(path=None) -> dict:
-    """Phase-2 params: each cluster's shared minimum and its members'
-    params (used by config.PHASE2_METHODS, the two-vote ensembles)."""
-    path = config.CLUSTER_PARAMS_PATH if path is None else path
-    if not path.exists():
-        raise FileNotFoundError(
-            f"{path} not found — run tuning phase 2 first "
-            f"(`python main.py phase2`)")
     return json.loads(path.read_text())
 
 
 # ---------------------------------------------------------------------------
 # Pool worker (module-level so it pickles under spawn)
 # ---------------------------------------------------------------------------
-_PHASES: tuple[dict, dict] | None = None  # (phase 1, phase 2)
+_PARAMS: dict | None = None  # selected_params.json, loaded once per worker
 
 
 def run_and_save(task: tuple[str, str, int, str]) -> tuple[str, str, float]:
     """Run one (generator, mode, seed, method) unit and persist it.
     Returns (sid, method, runtime_s). Safe to call in pool workers."""
-    global _PHASES
-    if _PHASES is None:
-        _PHASES = (load_selected_params(), load_cluster_params())
+    global _PARAMS
+    if _PARAMS is None:
+        _PARAMS = load_selected_params()
     generator, mode, seed, method = task
-    params = method_params(method, *_PHASES)
-    result = run_method(method, generator, mode, seed, params)
-    save_run(generator, mode, seed, method, result, params)
+    result = run_method(method, generator, mode, seed, _PARAMS)
+    save_run(generator, mode, seed, method, result, _PARAMS)
     return stream_id(generator, mode, seed), method, result["runtime_s"]
 
 
-def load_runs(test_dir=None) -> list[dict]:
-    """Every finished run of a roster method under ``test_dir`` (default
-    config.TEST_DIR): dicts with dir, meta and alarms."""
+def load_runs(test_dir=None, selected_params: dict | None = None
+              ) -> list[dict]:
+    """Every finished run under ``test_dir`` (default config.TEST_DIR):
+    dicts with dir, meta and alarms. With ``selected_params``, only the
+    runs made with exactly those params (older runs are stale)."""
     test_dir = config.TEST_DIR if test_dir is None else test_dir
     runs = []
     if not test_dir.exists():
         return runs
     for meta_path in sorted(test_dir.glob("*/meta.json")):
         meta = json.loads(meta_path.read_text())
-        if meta["method"] not in config.METHODS:
-            continue  # stale folder of a method dropped from the roster
+        if (selected_params is not None
+                and meta.get("selected_params") != selected_params):
+            continue  # stale: run with an older tuning
         folder = meta_path.parent
         alarms = json.loads((folder / "alarms.json").read_text())["alarms"]
         runs.append({"dir": folder, "meta": meta, "alarms": alarms})
